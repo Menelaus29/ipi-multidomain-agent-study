@@ -49,7 +49,7 @@ Greshake et al. categorize how an injection reaches the model into four methods 
 | **Passive (by retrieval)** | Content is placed in a public location an automated query is likely to retrieve (e.g., SEO-optimized poisoned pages). | **Slack only**, via `get_webpage`. Not reachable in Workspace or Banking - neither has a fetch/search-the-web tool. |
 | **Active** | Content is actively sent to reach the agent (e.g., an email delivered to an inbox). | **Workspace**: an email arriving via `get_unread_emails`/`get_received_emails`. **Banking**: a transaction with a malicious memo arriving via `get_most_recent_transactions`. **Slack**: a message arriving via `read_channel_messages`/`read_inbox`. This is the dominant delivery method across all three domains. |
 | **User-driven** | The legitimate user is tricked into pasting or entering attacker content themselves. | **Not modeled by this study.** AgentDojo's injection tasks are attacker-to-tool-output by design, not user-mediated. |
-| **Hidden / multi-stage** | The payload is encoded, or a small initial injection instructs the agent to fetch a larger secondary payload. | Maps onto the `encoding_obfuscation` and `multi_step_sleeper` payload categories in `taxonomy.md`. Instantiated via file content (Workspace's `create_file`/`append_to_file`, Banking's `read_file`), which, unlike a short email subject line or transaction memo, has enough room to carry a more elaborate or staged payload. |
+| **Hidden / multi-stage** | The payload is encoded, or a small initial injection instructs the agent to fetch a larger secondary payload. | Maps onto the `encoding_obfuscation` and `multi_step_sleeper` payload categories in [`taxonomy.md`](taxonomy.md). Instantiated via file content (Workspace's `create_file`/`append_to_file`, Banking's `read_file`), which, unlike a short email subject line or transaction memo, has enough room to carry a more elaborate or staged payload. |
 
 ---
 
@@ -128,12 +128,12 @@ Adapted from Greshake et al.'s general framing [1], tagged against what this stu
 
 ## References
 
-[1] Greshake, K., Abdelnabi, S., Mishra, S., Endres, C., Holz, T., & Fritz, M. (2023). Not what you've signed up for: Compromising real-world LLM-integrated applications with indirect prompt injection.
+[1] K. Greshake, S. Abdelnabi, S. Mishra, C. Endres, T. Holz, and M. Fritz, "Not What You've Signed Up For: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection," arXiv preprint arXiv:2302.12173, 2023.
 
-[2] Debenedetti, E., Zhang, J., Balunović, M., Beurer-Kellner, L., Fischer, M., & Tramèr, F. (2024). AgentDojo: A dynamic environment to evaluate prompt injection attacks and defenses for LLM agents.
+[2] E. Debenedetti, J. Zhang, M. Balunović, L. Beurer-Kellner, M. Fischer, and F. Tramèr, "AgentDojo: A Dynamic Environment to Evaluate Attacks and Defenses for LLM Agents," arXiv preprint arXiv:2406.13352, 2024.
 
-[3] Zhan, Q., Liang, Z., Ying, Z., & Kang, D. (2024). InjecAgent: Benchmarking indirect prompt injections in tool-integrated large language model agents.
+[3] Q. Zhan, Z. Liang, Z. Ying, and D. Kang, "InjecAgent: Benchmarking Indirect Prompt Injections in Tool-Integrated Large Language Model Agents," arXiv preprint arXiv:2403.02691, 2024.
 
-[4] OWASP Top 10 for LLM Applications (2025).
+[4] OWASP Foundation, "OWASP Top 10 for Large Language Model Applications (2025)," 2025. [Online]. Available: https://owasp.org/www-project-top-10-for-large-language-model-applications/.
 
-[5] OWASP Top 10 for Agentic Applications (2026).
+[5] OWASP Foundation, "OWASP Top 10 for Agentic Applications for 2026," 2026. [Online]. Available: https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/.
