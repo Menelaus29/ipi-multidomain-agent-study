@@ -10,14 +10,17 @@ the entry's documented channel.  The raw AgentDojo trace remains in
 the benchmark security verdict, payload metadata, and full message trace.
 
 Examples:
-    # Inspect the complete planned matrix without API calls.
+    # Inspect the documented stratified matrix without API calls.
     python -m src.experiments.run_baseline --plan
 
     # Phase 6 dry run: at most six recorded task attempts.
     python -m src.experiments.run_baseline --max-runs 6
 
-    # Resume the full matrix after the dry run.
+    # Resume the stratified matrix after the dry run.
     python -m src.experiments.run_baseline
+
+    # Inspect the original full task-by-injection expansion (no API calls).
+    python -m src.experiments.run_baseline --matrix full --plan
 """
 
 from __future__ import annotations
@@ -31,7 +34,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agentdojo.attacks import load_attack
 from agentdojo.attacks.attack_registry import ATTACKS, register_attack
 from agentdojo.attacks.base_attacks import BaseAttack
 from agentdojo.scripts.benchmark import benchmark_suite
@@ -93,6 +95,14 @@ CHANNEL_VECTORS: dict[str, dict[str, tuple[str, ...]]] = {
             "prompt_injection_channel",
         ),
     },
+}
+
+# Phase 6's documented stratified matrix uses one benchmark-native injection
+# goal per suite.  These task IDs were verified in AgentDojo v1.2.2.
+STRATIFIED_INJECTION_TASKS = {
+    "workspace": "injection_task_0",
+    "banking": "injection_task_0",
+    "slack": "injection_task_1",
 }
 
 
@@ -206,25 +216,41 @@ def iter_cases(
     domains: set[str] | None = None,
     payload_ids: set[str] | None = None,
     injection_tasks: set[str] | None = None,
+    matrix: str = "stratified",
 ) -> Iterator[tuple[PayloadEntry, str, str, str, str]]:
     """Yield ``(payload, domain, vector, user_task, injection_task)`` cases."""
+    if matrix not in {"stratified", "full"}:
+        raise ValueError(f"Unknown matrix mode: {matrix!r}")
+    suites: dict[str, Any] = {}
+    eligible_tasks: dict[tuple[str, str], list[str]] = {}
     for payload in payloads:
         if payload_ids is not None and payload.id not in payload_ids:
             continue
         for domain in payload.domain:
             if domains is not None and domain not in domains:
                 continue
-            suite = get_suite(BENCHMARK_VERSION, domain)
-            selected_injection_tasks = tuple(
-                task_id
-                for task_id in suite.injection_tasks
-                if injection_tasks is None or task_id in injection_tasks
-            )
-            unknown = (injection_tasks or set()) - set(suite.injection_tasks)
+            suite = suites.get(domain)
+            if suite is None:
+                suite = get_suite(BENCHMARK_VERSION, domain)
+                suites[domain] = suite
+            requested_tasks = injection_tasks
+            if matrix == "stratified" and requested_tasks is None:
+                requested_tasks = {STRATIFIED_INJECTION_TASKS[domain]}
+            selected_injection_tasks = tuple(task_id for task_id in suite.injection_tasks if requested_tasks is None or task_id in requested_tasks)
+            unknown = (requested_tasks or set()) - set(suite.injection_tasks)
             if unknown and len(selected_injection_tasks) == 0:
                 raise ValueError(f"{domain} has no requested injection task(s): {sorted(unknown)}")
-            for vector in compatible_vectors(domain, payload.channel, suite):
-                for user_task_id in eligible_user_tasks(suite, payload, vector):
+            vectors = compatible_vectors(domain, payload.channel, suite)
+            if matrix == "stratified":
+                vectors = vectors[:1]
+            for vector in vectors:
+                cache_key = (domain, vector)
+                if cache_key not in eligible_tasks:
+                    eligible_tasks[cache_key] = eligible_user_tasks(suite, payload, vector)
+                user_task_ids = eligible_tasks[cache_key]
+                if matrix == "stratified":
+                    user_task_ids = user_task_ids[:1]
+                for user_task_id in user_task_ids:
                     for injection_task_id in selected_injection_tasks:
                         yield payload, domain, vector, user_task_id, injection_task_id
 
@@ -325,6 +351,12 @@ def execute_case(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true", help="Print planned cases without invoking the API")
+    parser.add_argument(
+        "--matrix",
+        choices=("stratified", "full"),
+        default="stratified",
+        help="matrix breadth; stratified is the documented Phase 6 scope",
+    )
     parser.add_argument("--max-runs", type=int, help="Stop after this many new task attempts")
     parser.add_argument("--domain", action="append", choices=("workspace", "banking", "slack"), help="Restrict to a domain; repeatable")
     parser.add_argument("--payload-id", action="append", help="Restrict to a corpus payload ID; repeatable")
@@ -344,6 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             domains=set(args.domain) if args.domain else None,
             payload_ids=set(args.payload_id) if args.payload_id else None,
             injection_tasks=set(args.injection_task) if args.injection_task else None,
+            matrix=args.matrix,
         )
     )
     if args.plan:
