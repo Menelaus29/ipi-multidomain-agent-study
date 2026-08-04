@@ -1,3 +1,3 @@
 # Decisions Log
 
-- Phase 4.8: the branch was pushed, but PR creation/merge could not be automated because the GitHub CLI is not installed; the PR must be created and merged manually before tagging `phase-4-done`.
+- Phase 3.5: switch to Google AI Studio as API key provider instead of Groq. Reason: persistent compability issues with Groq's OpenAI-compatible endpoint, too complicated to fix.
