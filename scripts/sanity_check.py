@@ -34,7 +34,7 @@ load_dotenv()
 from agentdojo.scripts.benchmark import benchmark_suite
 from agentdojo.task_suite.load_suites import get_suite
 
-from scripts.google_llm_factory import get_google_testing_llm
+from src.llm_providers.google_llm_factory import get_google_testing_llm
 
 
 def run_one_suite_check(
