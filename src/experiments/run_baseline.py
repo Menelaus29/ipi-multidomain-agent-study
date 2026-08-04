@@ -13,6 +13,9 @@ Examples:
     # Inspect the documented stratified matrix without API calls.
     python -m src.experiments.run_baseline --plan
 
+    # Save the reviewed plan for the recorded 33-case matrix.
+    python -m src.experiments.run_baseline --plan --plan-output data/baseline/plan.tsv
+
     # Phase 6 dry run: at most six recorded task attempts.
     python -m src.experiments.run_baseline --max-runs 6
 
@@ -26,8 +29,10 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
+import sys
 import uuid
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
@@ -39,6 +44,7 @@ from agentdojo.attacks.base_attacks import BaseAttack
 from agentdojo.models import ModelsEnum
 from agentdojo.scripts.benchmark import benchmark_suite
 from agentdojo.task_suite.load_suites import get_suite
+from google.genai.errors import ClientError
 
 from src.llm_providers.google_llm_factory import PRIMARY_MODEL, get_google_primary_llm
 from src.schemas import PayloadEntry, RunResult, SchemaValidationError
@@ -281,8 +287,27 @@ def completed_cases(results_path: Path) -> set[tuple[str, ...]]:
 
 
 def _vector_from_notes(notes: str) -> str | None:
-    match = re.search(r"(?:^|;) injection_vector=([^;]+)", notes)
+    match = re.search(r"(?:^|;\s*)injection_vector=([^;]+)", notes)
     return match.group(1) if match else None
+
+
+def is_quota_exhausted(error: Exception) -> bool:
+    """Return whether a Google API error represents a quota/rate-limit stop."""
+    message = str(error).lower()
+    return "429" in message and ("resource_exhausted" in message or "quota" in message)
+
+
+def write_plan(
+    cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
+    path: Path,
+) -> None:
+    """Write a reviewable TSV manifest without making any model/API calls."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(("payload_id", "domain", "channel", "injection_vector", "user_task_id", "injection_task_id"))
+        for payload, domain, vector, user_task_id, injection_task_id in cases:
+            writer.writerow((payload.id, domain, payload.channel, vector, user_task_id, injection_task_id))
 
 
 def _raw_trace_path(logdir: Path, user_task_id: str, attack_name: str, injection_task_id: str) -> Path:
@@ -307,7 +332,11 @@ def execute_case(
     """Run one AgentDojo task attempt and append its validated JSONL record."""
     suite = get_suite(BENCHMARK_VERSION, domain)
     attack_name = register_payload_attack(payload, injection_vector)
-    logdir = RAW_ROOT / payload.id / domain / injection_vector
+    # AgentDojo's injection-task utility traces use the "none" attack path.
+    # Sharing a domain root lets later payload cases reuse those completed
+    # native-task checks while their distinct attack names keep raw attack
+    # traces separate.
+    logdir = RAW_ROOT / domain
     # Construct a fresh primary-only LLM per task.  No fallback/testing factory
     # is used anywhere in this recorded baseline path.
     results = benchmark_suite(
@@ -354,6 +383,7 @@ def execute_case(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", action="store_true", help="Print planned cases without invoking the API")
+    parser.add_argument("--plan-output", type=Path, help="Optional TSV path for a no-API plan manifest")
     parser.add_argument(
         "--matrix",
         choices=("stratified", "full"),
@@ -383,6 +413,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     if args.plan:
+        if args.plan_output:
+            write_plan(cases, args.plan_output.resolve())
+            print(f"Wrote plan manifest: {args.plan_output.resolve()}")
         print(f"Planned baseline cases: {len(cases)}")
         for payload, domain, vector, user_task_id, injection_task_id in cases:
             print(f"{payload.id}\t{domain}\t{payload.channel}\t{vector}\t{user_task_id}\t{injection_task_id}")
@@ -398,7 +431,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             continue
         if args.max_runs is not None and executed >= args.max_runs:
             break
-        record = execute_case(payload, domain, vector, user_task_id, injection_task_id, results_path)
+        try:
+            record = execute_case(payload, domain, vector, user_task_id, injection_task_id, results_path)
+        except ClientError as error:
+            if not is_quota_exhausted(error):
+                raise
+            print(
+                "Stopping cleanly: Google API quota/rate limit reached. "
+                f"{executed} completed case(s) remain checkpointed in {results_path}.",
+                file=sys.stderr,
+            )
+            return 2
         executed += 1
         print(
             f"Recorded {record.run_id}: payload={record.payload_id}, domain={record.domain}, "
