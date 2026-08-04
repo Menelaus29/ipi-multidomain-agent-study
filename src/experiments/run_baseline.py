@@ -32,10 +32,11 @@ import uuid
 from collections.abc import Iterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from agentdojo.attacks.attack_registry import ATTACKS, register_attack
 from agentdojo.attacks.base_attacks import BaseAttack
+from agentdojo.models import ModelsEnum
 from agentdojo.scripts.benchmark import benchmark_suite
 from agentdojo.task_suite.load_suites import get_suite
 
@@ -311,7 +312,9 @@ def execute_case(
     # is used anywhere in this recorded baseline path.
     results = benchmark_suite(
         suite=suite,
-        model=get_google_primary_llm(),
+        # AgentDojo's runtime accepts a constructed BasePipelineElement here,
+        # although its installed annotation is still limited to ModelsEnum.
+        model=cast(ModelsEnum, get_google_primary_llm()),
         logdir=logdir,
         force_rerun=False,
         benchmark_version=BENCHMARK_VERSION,
