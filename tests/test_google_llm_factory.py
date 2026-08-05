@@ -9,6 +9,7 @@ from google.genai.errors import ClientError
 
 from src.llm_providers.google_llm_factory import (
     FALLBACK_MODEL,
+    HTTP_REQUEST_TIMEOUT_MS,
     MIN_REQUEST_INTERVAL_SECONDS,
     PRIMARY_MODEL,
     PRIMARY_RPD_LIMIT,
@@ -72,6 +73,7 @@ class GoogleLLMFactoryTests(unittest.TestCase):
         self.assertEqual("gemini-3.5-flash-lite", PRIMARY_MODEL)
         self.assertEqual("gemini-3.1-flash-lite", FALLBACK_MODEL)
         self.assertEqual((15, 250_000, 500), (PRIMARY_RPM_LIMIT, PRIMARY_TPM_LIMIT, PRIMARY_RPD_LIMIT))
+        self.assertEqual(120_000, HTTP_REQUEST_TIMEOUT_MS)
 
     def test_request_budget_stops_before_an_excess_api_call(self) -> None:
         fake_time = _FakeTime()

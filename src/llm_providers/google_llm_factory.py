@@ -84,6 +84,7 @@ _AGENTDOJO_GEMINI_ID = "gemini-2.5-flash-preview-04-17"
 PRIMARY_RPM_LIMIT = 15
 PRIMARY_TPM_LIMIT = 250_000
 PRIMARY_RPD_LIMIT = 500
+HTTP_REQUEST_TIMEOUT_MS = 120_000
 
 # Pace to 14 RPM, one below the active 15-RPM ceiling. This applies to every
 # tool-calling turn rather than merely spacing top-level benchmark cases.
@@ -347,7 +348,15 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
         AgentDojo Gemini model ID so that attacks can resolve the
         human-readable model name via get_model_name_from_pipeline().
     """
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", "").strip())
+    client = genai.Client(
+        api_key=os.getenv("GOOGLE_API_KEY", "").strip(),
+        http_options=genai_types.HttpOptions(
+            timeout=HTTP_REQUEST_TIMEOUT_MS,
+            # Keep every HTTP attempt visible to this module's limiter/retry
+            # accounting instead of permitting hidden SDK-level retries.
+            retry_options=genai_types.HttpRetryOptions(attempts=1),
+        ),
+    )
     llm = Gemini3LLM(model_name, client)
     # Name format: "google-<model_name> [gemini-2.5-flash-preview-04-17]"
     # get_model_name_from_pipeline() matches the bracketed key -> 'AI model developed by Google'
@@ -423,7 +432,13 @@ def get_google_testing_llm() -> FallbackGemini3LLM:
     model must never enter the ASR tables. Use get_google_primary_llm() for
     all recorded runs (Phase 6, 9, 11, 12).
     """
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", "").strip())
+    client = genai.Client(
+        api_key=os.getenv("GOOGLE_API_KEY", "").strip(),
+        http_options=genai_types.HttpOptions(
+            timeout=HTTP_REQUEST_TIMEOUT_MS,
+            retry_options=genai_types.HttpRetryOptions(attempts=1),
+        ),
+    )
     llm = FallbackGemini3LLM(PRIMARY_MODEL, client)
     llm.name = f"google-{PRIMARY_MODEL} [{_AGENTDOJO_GEMINI_ID}]"
     return llm
