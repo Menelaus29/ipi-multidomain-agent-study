@@ -197,6 +197,58 @@ class RunBaselineTests(unittest.TestCase):
         )
         self.assertFalse(run_baseline.is_quota_exhausted(Exception("500 internal server error")))
 
+    def test_errored_agentdojo_trace_is_rejected(self) -> None:
+        with self.assertRaises(run_baseline.BenchmarkTraceError):
+            run_baseline.ensure_completed_raw_trace(
+                {"error": "503 UNAVAILABLE", "messages": []},
+                Path("errored.json"),
+            )
+
+    def test_prune_errored_results_keeps_only_completed_traces(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_directory = root / "data" / "baseline" / "raw"
+            raw_directory.mkdir(parents=True)
+            good_raw = raw_directory / "good.json"
+            bad_raw = raw_directory / "bad.json"
+            good_raw.write_text(json.dumps({"error": None}), encoding="utf-8")
+            bad_raw.write_text(json.dumps({"error": "503 UNAVAILABLE"}), encoding="utf-8")
+
+            def record(run_id: str, raw_name: str) -> RunResult:
+                return RunResult(
+                    run_id=run_id,
+                    timestamp="2026-08-05T00:00:00+00:00",
+                    domain="workspace",
+                    user_task_id="user_task_14",
+                    injection_task_id="injection_task_0",
+                    payload_id="direct-01",
+                    channel="email_body",
+                    model="google-gemini-3.5-flash-lite",
+                    defense="none",
+                    attack_success=False,
+                    tool_calls=[],
+                    notes=(
+                        "injection_vector=email_events_injection; "
+                        f"raw_trace=data/baseline/raw/{raw_name}"
+                    ),
+                )
+
+            results_path = root / "data" / "baseline" / "results.jsonl"
+            results_path.write_text(
+                "\n".join(
+                    json.dumps(item.__dict__)
+                    for item in (record("good", "good.json"), record("bad", "bad.json"))
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch.object(run_baseline, "PROJECT_ROOT", root):
+                removed = run_baseline.prune_errored_results(results_path)
+
+            self.assertEqual(1, removed)
+            remaining = [json.loads(line) for line in results_path.read_text().splitlines()]
+            self.assertEqual(["good"], [item["run_id"] for item in remaining])
+
     def test_quota_error_stops_cleanly_without_losing_prior_checkpoints(self) -> None:
         class FakeClientError(Exception):
             pass

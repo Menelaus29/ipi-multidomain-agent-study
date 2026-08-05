@@ -164,6 +164,10 @@ class _CandidateProbe(CorpusPayloadAttack):
     name = "corpus_payload_candidate_probe"
 
 
+class BenchmarkTraceError(RuntimeError):
+    """Raised when AgentDojo wrote a skipped/errored trace, not a valid run."""
+
+
 _UNRESOLVED_TEMPLATE = re.compile(r"\{\{[^{}]+\}\}")
 
 
@@ -346,6 +350,54 @@ def _vector_from_notes(notes: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _raw_trace_from_notes(notes: str) -> Path | None:
+    match = re.search(r"(?:^|;\s*)raw_trace=([^;]+)", notes)
+    if match is None:
+        return None
+    path = Path(match.group(1))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def ensure_completed_raw_trace(raw_trace: dict[str, Any], raw_path: Path) -> None:
+    """Reject AgentDojo's synthetic verdicts for skipped API-error traces."""
+    if raw_trace.get("error"):
+        raise BenchmarkTraceError(
+            f"AgentDojo trace is errored/skipped, not a valid result: {raw_path}: "
+            f"{raw_trace['error']}"
+        )
+
+
+def prune_errored_results(results_path: Path) -> int:
+    """Atomically remove checkpoint rows whose referenced raw trace has an error."""
+    if not results_path.exists():
+        return 0
+    retained_lines: list[str] = []
+    removed = 0
+    for line_number, line in enumerate(results_path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+            result = RunResult.from_dict(record, path=f"{results_path}:{line_number}")
+        except (json.JSONDecodeError, SchemaValidationError) as exc:
+            raise SchemaValidationError(f"Cannot repair invalid results file: {exc}") from exc
+        raw_path = _raw_trace_from_notes(result.notes)
+        if raw_path is None or not raw_path.is_file():
+            raise SchemaValidationError(
+                f"{results_path}:{line_number} has no readable raw_trace reference"
+            )
+        raw_trace = json.loads(raw_path.read_text(encoding="utf-8"))
+        if raw_trace.get("error"):
+            removed += 1
+        else:
+            retained_lines.append(line)
+    if removed:
+        temporary_path = results_path.with_suffix(results_path.suffix + ".tmp")
+        temporary_path.write_text("\n".join(retained_lines) + "\n", encoding="utf-8")
+        temporary_path.replace(results_path)
+    return removed
+
+
 def is_quota_exhausted(error: Exception) -> bool:
     """Return whether a Google API error represents a quota/rate-limit stop."""
     message = str(error).lower()
@@ -392,6 +444,8 @@ def execute_case(
     user_task_id: str,
     injection_task_id: str,
     results_path: Path,
+    *,
+    force_rerun: bool = False,
 ) -> RunResult:
     """Run one AgentDojo task attempt and append its validated JSONL record."""
     suite = get_suite(BENCHMARK_VERSION, domain)
@@ -411,7 +465,7 @@ def execute_case(
         # although its installed annotation is still limited to ModelsEnum.
         model=cast(ModelsEnum, get_google_primary_llm()),
         logdir=logdir,
-        force_rerun=False,
+        force_rerun=force_rerun,
         benchmark_version=BENCHMARK_VERSION,
         user_tasks=(user_task_id,),
         injection_tasks=(injection_task_id,),
@@ -420,6 +474,7 @@ def execute_case(
     security = results["security_results"][(user_task_id, injection_task_id)]
     raw_path = _raw_trace_path(logdir, user_task_id, attack_name, injection_task_id)
     raw_trace = json.loads(raw_path.read_text(encoding="utf-8"))
+    ensure_completed_raw_trace(raw_trace, raw_path)
     relative_raw_path = raw_path.relative_to(PROJECT_ROOT).as_posix()
     api_request_attempts = get_google_request_attempt_count() - requests_before
     elapsed_seconds = time.monotonic() - started_at
@@ -462,6 +517,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-runs", type=int, help="Stop after this many new task attempts")
     parser.add_argument(
+        "--force-rerun",
+        action="store_true",
+        help="Rerun non-checkpointed AgentDojo traces even if a raw cache file exists",
+    )
+    parser.add_argument(
+        "--prune-errored-results",
+        action="store_true",
+        help="Remove checkpoint rows backed by errored AgentDojo traces before resuming",
+    )
+    parser.add_argument(
         "--max-api-requests",
         type=int,
         help=(
@@ -503,6 +568,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     results_path = args.results_path.resolve()
     configure_google_request_attempt_limit(args.max_api_requests)
+    if args.prune_errored_results:
+        removed = prune_errored_results(results_path)
+        print(f"Pruned {removed} errored/skipped checkpoint row(s) from {results_path}")
     completed = completed_cases(results_path)
     executed = 0
     session_requests_before = get_google_request_attempt_count()
@@ -514,7 +582,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.max_runs is not None and executed >= args.max_runs:
             break
         try:
-            record = execute_case(payload, domain, vector, user_task_id, injection_task_id, results_path)
+            record = execute_case(
+                payload,
+                domain,
+                vector,
+                user_task_id,
+                injection_task_id,
+                results_path,
+                force_rerun=args.force_rerun,
+            )
         except (ClientError, RequestBudgetExceeded) as error:
             if not is_quota_exhausted(error):
                 raise
@@ -526,6 +602,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+        except BenchmarkTraceError as error:
+            print(
+                "Stopping cleanly: AgentDojo produced an errored/skipped trace; "
+                f"no RunResult was appended. {error}",
+                file=sys.stderr,
+            )
+            return 3
         executed += 1
         print(
             f"Recorded {record.run_id}: payload={record.payload_id}, domain={record.domain}, "
