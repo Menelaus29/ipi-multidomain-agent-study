@@ -26,7 +26,7 @@ is permanently bypassed in favour of the Python API.
 
 **Reason:** AgentDojo's installed `BaseInjectionTask.security()` contract returns `True` when the injection goal was executed, so the previous inversion was incorrect. AgentDojo v1.2.2 also has no native Slack message-body injection placeholder: `injection_dora_0` and `injection_phishing_1` are explicitly webpage vectors, while `prompt_injection_channel` modifies a channel name rather than a chat message.
 
-**Impact:** The Workspace and Banking pilot verdicts were corrected from successful to failed attacks, and the mislabeled Slack record was rejected rather than entering the baseline.
+**Impact:** The Workspace and Banking pilot verdicts were corrected from successful to failed attacks, and all three malformed Gemini 3.6 pilot artifacts were excluded and later deleted after a successful replacement dry run.
 
 ### Phase 6 — Goal-bound attack rendering and sleeper exclusion
 
@@ -34,7 +34,7 @@ is permanently bypassed in favour of the Python API.
 
 **Reason:** The previous renderer explicitly labeled the content untrusted, added explanatory meta-text, and combined unrelated placeholder actions with the native goal. The sleeper entries did not actually install attacker-controlled second-stage content; implementing a genuine staged environment would add substantial custom-suite complexity for little baseline benefit.
 
-**Impact:** The two completed 2026-08-05 cases are rejected pilots and cannot be resumed from cache; the empirical corpus is 19 payloads, and AgentDojo's native `injecagent` attack is run separately as a three-suite positive control.
+**Impact:** The malformed Gemini 3.6 pilots cannot be resumed from cache and were deleted after the successful Gemini 3.5 replacement run; the empirical corpus is 19 payloads, and AgentDojo's native `injecagent` attack is run separately as a three-suite positive control.
 
 ### Phase 6 — Primary-model and replicated-matrix expansion
 
