@@ -42,4 +42,12 @@ is permanently bypassed in favour of the Python API.
 
 **Reason:** The active Gemini 3.5 Flash-Lite quota is 15 RPM, 250k TPM, and 500 RPD, compared with the former primary's 20-RPD limit. This makes within-cell replication feasible while retaining one model across undefended, defended, and adaptive experiments.
 
-**Impact:** The baseline and defended plans contain 110 matched cases (Workspace 52, Banking 46, Slack 12); adaptive mutation search will also use the primary model, while its exact iteration budget remains evidence-driven until Phase 10.
+**Impact:** This produced the 110-case static baseline (Workspace 52, Banking 46, Slack 12) with the primary model. Its planned direct reuse as the defended matrix was later superseded by the Phase 6A decision below after the observed static ASR was 0/110.
+
+### Phase 6A — Calibrate a measurable baseline after the static 0/110 result
+
+**Decision:** Preserve the completed 110-case corpus run as a static null result, insert a model-adaptive development/calibration phase before defense implementation, freeze three attack families, and require a prospective held-out undefended baseline with at least 15 successful attacks overall and at least five per domain before estimating defense effectiveness.
+
+**Reason:** All 110 payloads reached Gemini 3.5 Flash-Lite, yet none executed the native AgentDojo injection goal; legitimate utility still succeeded in 90 cases. A zero undefended ASR creates a floor at which a defended zero cannot demonstrate security improvement, while recent work shows that fixed attacks can understate risk against newer, model-dependent targets and that attacks tuned after seeing evaluation cases invalidate held-out claims.
+
+**Impact:** Phase 7 now reports the original static null separately from a frozen calibrated baseline; Phase 8.3 and all Phase 9 API execution are blocked until Phase 6A passes. New tooling and artifacts live under `src/experiments/`, `data/attack_calibration/`, and `data/calibrated_baseline/`; all new API runners use a dashboard-aware hard quota guard with a 25-request reserve. Phase 10 remains a separate defense-aware adaptive evaluation and does not overwrite the Phase 6A attack set.
