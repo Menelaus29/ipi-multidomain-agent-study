@@ -101,7 +101,7 @@ Derived from the tool lists above (§4).
 |`file_content`|Workspace + Banking|`get_file_by_id`, `search_files` (WS); `read_file` (B)|
 |`transaction_memo`|Banking only|`get_most_recent_transactions`, `get_scheduled_transactions`|
 |`web_content`|**Slack only**|`get_webpage`, `post_webpage`|
-|`chat_message`|Slack only|`read_channel_messages`, `read_inbox`|
+|`chat_message`|Slack only|`read_channel_messages`, `read_inbox`; retrievable, but AgentDojo v1.2.2 has no native message-body injection placeholder, so it is not used as a recorded Phase 6 stratum|
 
 ---
 

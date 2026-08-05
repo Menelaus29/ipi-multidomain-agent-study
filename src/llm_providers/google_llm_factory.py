@@ -8,70 +8,189 @@ free Google AI Studio path instead:
     genai.Client(api_key=GOOGLE_API_KEY)
 
 GEMINI 3.x THINKING COMPATIBILITY (discovered 2026-08-03):
-    Gemini 3.x models (3.5-flash-lite, 3.6-flash, etc.) enable "thinking"
+    Gemini 3.x models (3.1-flash-lite, 3.5-flash-lite, etc.) enable "thinking"
     by default. When thinking is active, the model embeds a thought_signature
     field in every function call part. AgentDojo's GoogleLLM was written
     before Gemini 3.x and does not forward thought_signature in subsequent
     turns, causing the API to return:
         400 INVALID_ARGUMENT: Function call is missing a thought_signature
-    Fix: subclass GoogleLLM and set thinking_config=ThinkingConfig(
-    thinking_budget=0) in GenerateContentConfig. thinking_budget=0 is the
-    documented disable flag (see google-genai ThinkingConfig). Disabling
-    thinking is appropriate here — this is a tool-calling benchmark, not a
-    reasoning benchmark, and thinking adds latency/tokens with no benefit.
+    Fix: subclass GoogleLLM, cache the raw response Parts, and replay them
+    verbatim on subsequent turns so thought_signature is preserved.
 
-Because GoogleLLM.__init__ accepts any genai.Client directly, no subclassing
-is needed — we just swap the client constructor and pass the object through
-the Python API (benchmark_suite(model=llm)), bypassing get_llm()/ModelsEnum.
+GoogleLLM.__init__ accepts any genai.Client directly, so the subclass can use
+the AI Studio API-key client and pass the object through the Python API
+(benchmark_suite(model=llm)), bypassing get_llm()/ModelsEnum.
 
 WHY THIS IS SIMPLER THAN THE GROQ WRAPPER:
   - GoogleLLM already handles $defs/$ref inlining (resolve_refs()),
     additionalProperties removal, and null-arg safety (args or {}).
   - It uses native google-genai SDK types, not OpenAI JSON schema, so
     anyOf/nullable and title-key issues do not exist.
-  - No subclass, no query() override, no schema normalisation needed.
+  - Only the Gemini turn-preservation and request-reliability behavior needs
+    a query() override; schema normalization remains AgentDojo's responsibility.
 
 PIPELINE NAME / ATTACK COMPATIBILITY:
   ToolKnowledgeAttack and ImportantInstructionsAttack call
   get_model_name_from_pipeline() at construction, which requires pipeline.name
-  to contain a substring from MODEL_NAMES. gemini-3.6-flash and
-  gemini-3.5-flash-lite are not in MODEL_NAMES (they postdate the installed
+  to contain a substring from MODEL_NAMES. gemini-3.5-flash-lite and
+  gemini-3.1-flash-lite are not in MODEL_NAMES (they postdate the installed
   AgentDojo version). Fix: embed a known Gemini key in the name.
   'gemini-2.5-flash-preview-04-17' -> 'AI model developed by Google'.
 
-MODEL IDs (confirmed live against Google AI Studio API, 2026-08-03):
-  PRIMARY_MODEL  = 'gemini-3.6-flash'    - GA, generateContent supported
-  FALLBACK_MODEL = 'gemini-3.5-flash-lite' - GA, generateContent supported
+MODEL IDs (verified against official Google documentation, 2026-08-05):
+  PRIMARY_MODEL  = 'gemini-3.5-flash-lite' - GA, generateContent supported
+  FALLBACK_MODEL = 'gemini-3.1-flash-lite' - GA, generateContent supported
 
 Note (Phase 4.2a): This file will be relocated to src/llm_providers/google_llm_factory.py
 when the full src/ tree is built.
 """
+import logging
 import os
+import threading
+import time
 from collections.abc import Sequence
+from typing import Callable, Literal
 
+import httpx
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from agentdojo.agent_pipeline.llms.google_llm import GoogleLLM, _function_to_google, _message_to_google, _merge_tool_result_messages, _google_to_assistant_message, chat_completion_request
+from google.genai.errors import ClientError, ServerError
+from agentdojo.agent_pipeline.llms.google_llm import (
+    GoogleLLM,
+    _function_to_google,
+    _google_to_assistant_message,
+    _merge_tool_result_messages,
+    _message_to_google,
+)
 from agentdojo.functions_runtime import EmptyEnv, Env, FunctionsRuntime
 from agentdojo.types import ChatMessage
 
 load_dotenv()
 
-# Primary model — used for every RECORDED result (Phases 6, 9, 11, 12).
-# Gemini 3.6 Flash: Google's current best Flash-class model.
-# Free tier via Google AI Studio (GOOGLE_API_KEY). Daily quota resets midnight PT.
-PRIMARY_MODEL = "gemini-3.6-flash"
+# Primary model — used for all recorded runs and adaptive mutation search.
+# Active free-tier constraints: 15 RPM, 250k TPM, and 500 RPD.
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
 
-# Fallback model — high volume, lower latency.
-# Used ONLY for Phase 10-11 adaptive-attack mutation search.
-# Never use for recorded numbers — mixing models breaks ASR comparability.
-FALLBACK_MODEL = "gemini-3.5-flash-lite"
+# Fallback model — testing/sanity recovery only. Never mix it into research
+# results; a consistent primary keeps all three experiment states comparable.
+FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 # A known AgentDojo MODEL_NAMES key embedded in pipeline.name so that
 # get_model_name_from_pipeline() resolves correctly for ToolKnowledgeAttack
 # and ImportantInstructionsAttack. Resolves to 'AI model developed by Google'.
 _AGENTDOJO_GEMINI_ID = "gemini-2.5-flash-preview-04-17"
+
+PRIMARY_RPM_LIMIT = 15
+PRIMARY_TPM_LIMIT = 250_000
+PRIMARY_RPD_LIMIT = 500
+HTTP_REQUEST_TIMEOUT_MS = 120_000
+
+# Pace to 14 RPM, one below the active 15-RPM ceiling. This applies to every
+# tool-calling turn rather than merely spacing top-level benchmark cases.
+REQUESTS_PER_MINUTE_SAFETY_TARGET = 14
+MIN_REQUEST_INTERVAL_SECONDS = 4.5
+RPM_RETRY_PAUSE_SECONDS = 65.0
+MAX_RPM_RETRIES = 2
+MAX_TRANSIENT_RETRIES = 2
+
+
+class RequestBudgetExceeded(RuntimeError):
+    """Raised before an API call would exceed a configured process budget."""
+
+
+class RequestRateLimiter:
+    """Serialize request starts and expose process-local attempt accounting."""
+
+    def __init__(
+        self,
+        min_interval_seconds: float,
+        *,
+        max_requests: int | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if min_interval_seconds < 0:
+            raise ValueError("min_interval_seconds cannot be negative")
+        if max_requests is not None and max_requests < 0:
+            raise ValueError("max_requests cannot be negative")
+        self.min_interval_seconds = min_interval_seconds
+        self._max_requests = max_requests
+        self._clock = clock
+        self._sleeper = sleeper
+        self._next_request_at = 0.0
+        self._requests_started = 0
+        self._lock = threading.Lock()
+
+    def wait_before_request(self) -> None:
+        """Wait until the next permitted start time and count the attempt."""
+        with self._lock:
+            if (
+                self._max_requests is not None
+                and self._requests_started >= self._max_requests
+            ):
+                raise RequestBudgetExceeded(
+                    "Configured Gemini request-attempt budget exhausted "
+                    f"({self._requests_started}/{self._max_requests})"
+                )
+            delay = self._next_request_at - self._clock()
+            if delay > 0:
+                self._sleeper(delay)
+            started_at = self._clock()
+            self._next_request_at = started_at + self.min_interval_seconds
+            self._requests_started += 1
+
+    def defer(self, seconds: float) -> None:
+        """Prevent any request from starting until at least ``seconds`` later."""
+        with self._lock:
+            self._next_request_at = max(self._next_request_at, self._clock() + seconds)
+
+    def set_max_requests(self, max_requests: int | None) -> None:
+        """Set an absolute process-local request ceiling without resetting usage."""
+        if max_requests is not None and max_requests < 0:
+            raise ValueError("max_requests cannot be negative")
+        with self._lock:
+            if max_requests is not None and max_requests < self._requests_started:
+                raise ValueError(
+                    "max_requests cannot be less than requests already started"
+                )
+            self._max_requests = max_requests
+
+    @property
+    def requests_started(self) -> int:
+        with self._lock:
+            return self._requests_started
+
+
+_REQUEST_RATE_LIMITER = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
+
+
+def get_google_request_attempt_count() -> int:
+    """Return Gemini request attempts started by this Python process."""
+    return _REQUEST_RATE_LIMITER.requests_started
+
+
+def configure_google_request_attempt_limit(max_requests: int | None) -> None:
+    """Prevent this process from starting more than ``max_requests`` API calls."""
+    _REQUEST_RATE_LIMITER.set_max_requests(max_requests)
+
+
+def classify_quota_error(
+    error: ClientError,
+) -> Literal["rpm", "rpd", "unknown"] | None:
+    """Classify a Google 429 from its structured details/message when possible."""
+    if getattr(error, "code", None) != 429 and "429" not in str(error):
+        return None
+    details = (
+        f"{getattr(error, 'details', '')} "
+        f"{getattr(error, 'message', '')} {error}"
+    ).lower()
+    compact = details.replace("_", "").replace("-", "").replace(" ", "")
+    if "requestsperday" in compact or "perday" in compact or "rpd" in compact:
+        return "rpd"
+    if "requestsperminute" in compact or "perminute" in compact or "rpm" in compact:
+        return "rpm"
+    return "unknown"
 
 
 class Gemini3LLM(GoogleLLM):
@@ -92,6 +211,60 @@ class Gemini3LLM(GoogleLLM):
     AgentDojo's internal ChatMessage format is fully preserved for
     scoring/logging — only the Google-API-facing message construction changes.
     """
+
+    def __init__(
+        self,
+        model: str,
+        client: genai.Client,
+        *,
+        rate_limiter: RequestRateLimiter | None = None,
+    ) -> None:
+        super().__init__(model, client)
+        self._rate_limiter = rate_limiter or _REQUEST_RATE_LIMITER
+
+    def _generate_content(
+        self,
+        google_messages: genai_types.ContentListUnion,
+        generation_config: genai_types.GenerateContentConfig,
+    ) -> genai_types.GenerateContentResponse:
+        """Call Gemini with request-level pacing and bounded transient retries."""
+        rpm_retries = 0
+        transient_retries = 0
+        while True:
+            self._rate_limiter.wait_before_request()
+            try:
+                return self.client.models.generate_content(
+                    model=self.model,
+                    contents=google_messages,
+                    config=generation_config,
+                )
+            except ClientError as error:
+                quota_kind = classify_quota_error(error)
+                if quota_kind != "rpm" or rpm_retries >= MAX_RPM_RETRIES:
+                    # Daily and ambiguous quota errors must reach the baseline
+                    # runner, which stops without writing an invalid result.
+                    raise
+                rpm_retries += 1
+                logging.warning(
+                    "Gemini per-minute quota reached; waiting %.0fs before retry %d/%d.",
+                    RPM_RETRY_PAUSE_SECONDS,
+                    rpm_retries,
+                    MAX_RPM_RETRIES,
+                )
+                self._rate_limiter.defer(RPM_RETRY_PAUSE_SECONDS)
+            except (ServerError, httpx.TimeoutException, httpx.ConnectError) as error:
+                if transient_retries >= MAX_TRANSIENT_RETRIES:
+                    raise
+                transient_retries += 1
+                delay = MIN_REQUEST_INTERVAL_SECONDS * (2 ** (transient_retries - 1))
+                logging.warning(
+                    "Transient Gemini error %s; waiting %.0fs before retry %d/%d.",
+                    type(error).__name__,
+                    delay,
+                    transient_retries,
+                    MAX_TRANSIENT_RETRIES,
+                )
+                self._rate_limiter.defer(delay)
 
     def query(
         self,
@@ -127,17 +300,21 @@ class Gemini3LLM(GoogleLLM):
             [genai_types.Tool(function_declarations=google_functions)] if google_functions else None
         )
         generation_config = genai_types.GenerateContentConfig(
-            temperature=self.temperature,
             max_output_tokens=self.max_tokens,
             tools=google_tools,
             system_instruction=system_instruction,
+            # The primary defaults to minimal thinking. Medium is a better fit
+            # for autonomous multi-step tool use and matches the former
+            # Gemini 3.6 Flash default used by this study.
+            thinking_config=(
+                genai_types.ThinkingConfig(
+                    thinking_level=genai_types.ThinkingLevel.MEDIUM
+                )
+                if self.model == PRIMARY_MODEL
+                else None
+            ),
         )
-        completion = chat_completion_request(
-            self.model,
-            self.client,
-            google_messages,  # type: ignore
-            generation_config=generation_config,
-        )
+        completion = self._generate_content(google_messages, generation_config)
         output = _google_to_assistant_message(completion)
 
         # Cache raw Parts for this turn so the next call can replay them
@@ -171,7 +348,15 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
         AgentDojo Gemini model ID so that attacks can resolve the
         human-readable model name via get_model_name_from_pipeline().
     """
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", "").strip())
+    client = genai.Client(
+        api_key=os.getenv("GOOGLE_API_KEY", "").strip(),
+        http_options=genai_types.HttpOptions(
+            timeout=HTTP_REQUEST_TIMEOUT_MS,
+            # Keep every HTTP attempt visible to this module's limiter/retry
+            # accounting instead of permitting hidden SDK-level retries.
+            retry_options=genai_types.HttpRetryOptions(attempts=1),
+        ),
+    )
     llm = Gemini3LLM(model_name, client)
     # Name format: "google-<model_name> [gemini-2.5-flash-preview-04-17]"
     # get_model_name_from_pipeline() matches the bracketed key -> 'AI model developed by Google'
@@ -180,17 +365,15 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
 
 
 def get_google_primary_llm() -> Gemini3LLM:
-    """Return a Gemini3LLM using the primary model (gemini-3.6-flash).
+    """Return a Gemini3LLM using the primary model (gemini-3.5-flash-lite).
     Use this for all recorded experiment runs.
     """
     return get_google_llm(PRIMARY_MODEL)
 
 
 def get_google_fallback_llm() -> Gemini3LLM:
-    """Return a Gemini3LLM using the fallback model (gemini-3.5-flash-lite).
-    Use ONLY for high-volume mutation search in the adaptive-attack loop
-    (Phase 10-11). Results produced with this model must never enter the
-    recorded ASR tables without a re-run on the primary model (Phase 11.4a).
+    """Return a Gemini3LLM using the fallback model (gemini-3.1-flash-lite).
+    Use only for non-recorded diagnostics when the primary is unavailable.
     """
     return get_google_llm(FALLBACK_MODEL)
 
@@ -199,11 +382,11 @@ class FallbackGemini3LLM(Gemini3LLM):
     """Gemini3LLM that automatically falls back to FALLBACK_MODEL on RPD exhaustion.
 
     ONLY for use in test/sanity-check scripts — never for recorded benchmark runs.
-    When the primary model (gemini-3.6-flash) hits its daily quota (RPD 429), this
-    class switches self.model to FALLBACK_MODEL (gemini-3.5-flash-lite) for the
+    When the primary model (gemini-3.5-flash-lite) hits its daily quota (RPD 429), this
+    class switches self.model to FALLBACK_MODEL (gemini-3.1-flash-lite) for the
     remainder of the session and retries the call transparently.
 
-    Distinction from RPM 429 (handled by tenacity retry in google_llm.py):
+    Distinction from RPM 429 (handled by Gemini3LLM._generate_content):
       - RPM 429: "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" → wait+retry
       - RPD 429: "GenerateRequestsPerDayPerProjectPerModel-FreeTier"    → switch model
 
@@ -224,10 +407,9 @@ class FallbackGemini3LLM(Gemini3LLM):
             return super().query(query, runtime, env, messages, extra_args)
         except ClientError as e:
             # Distinguish RPD (daily) from RPM (per-minute) quota exhaustion.
-            # RPM 429s are retried by tenacity and should not reach here.
-            # RPD 429s exhaust tenacity retries and propagate up.
-            err_str = str(e)
-            if "429" in err_str and "PerDay" in err_str and self.model != FALLBACK_MODEL:
+            # RPM 429s are retried by Gemini3LLM and should not reach here.
+            # RPD 429s propagate immediately.
+            if classify_quota_error(e) == "rpd" and self.model != FALLBACK_MODEL:
                 import logging
                 logging.warning(
                     f"[FallbackGemini3LLM] Daily quota exhausted for '{self.model}'. "
@@ -243,14 +425,20 @@ class FallbackGemini3LLM(Gemini3LLM):
 def get_google_testing_llm() -> FallbackGemini3LLM:
     """Return a FallbackGemini3LLM for use in test/sanity-check scripts.
 
-    Starts with gemini-3.6-flash (primary). Automatically switches to
-    gemini-3.5-flash-lite if the primary model's daily quota is exhausted.
+    Starts with gemini-3.5-flash-lite (primary). Automatically switches to
+    gemini-3.1-flash-lite if the primary model's daily quota is exhausted.
 
     DO NOT use this for recorded benchmark runs — results from the fallback
     model must never enter the ASR tables. Use get_google_primary_llm() for
     all recorded runs (Phase 6, 9, 11, 12).
     """
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY", "").strip())
+    client = genai.Client(
+        api_key=os.getenv("GOOGLE_API_KEY", "").strip(),
+        http_options=genai_types.HttpOptions(
+            timeout=HTTP_REQUEST_TIMEOUT_MS,
+            retry_options=genai_types.HttpRetryOptions(attempts=1),
+        ),
+    )
     llm = FallbackGemini3LLM(PRIMARY_MODEL, client)
     llm.name = f"google-{PRIMARY_MODEL} [{_AGENTDOJO_GEMINI_ID}]"
     return llm

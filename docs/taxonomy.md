@@ -71,7 +71,7 @@ Roughly: `direct_override` and `fake_system_message` are the most direct route t
 
 **Why distinct:** the danger isn't in any single piece of content in isolation - it requires the agent to take an action (a fetch, a combination) that a payload reviewed as static text wouldn't reveal.
 
-**Instantiation in this study:** requires a channel with a natural "fetch more" action available - most cleanly instantiated in **Slack**, via `get_webpage` (a trigger in a channel message instructs the agent to fetch a page containing the actual payload). Workspace and Banking have no fetch tool, so this category there is limited to file-content staging (a small trigger in an email/transaction memo pointing to a fuller payload already placed in a file via `search_files`/`read_file`).
+**Instantiation in this study:** excluded from the empirical corpus. A valid instance requires both an injected trigger and attacker-controlled second-stage content. The installed suites do not provide that pair in one selected case, and a custom stateful suite extension is outside the current simplicity/reliability tradeoff.
 
 ---
 
@@ -124,14 +124,16 @@ Quick-reference summary for tagging `src/payloads/corpus.json` entries.
 
 | Category | Best-suited channels | Domains where fully reachable |
 |---|---|---|
-| `direct_override` | Any (email, file, transaction memo, chat) | Workspace, Banking, Slack |
+| `direct_override` | Any (email, file, transaction memo, webpage) | Workspace, Banking, Slack |
 | `role_play_persona` | Any, most natural in longer-form content | Workspace, Banking, Slack |
 | `encoding_obfuscation` | File content | Workspace, Banking |
-| `multi_step_sleeper` | Chat + web (trigger/fetch pair); file-staging elsewhere | Slack (full pattern); Workspace, Banking (file-staging variant only) |
+| `multi_step_sleeper` | Requires a real trigger/second-stage pair | Taxonomy only; excluded from the empirical corpus |
 | `fake_system_message` | File, email; less natural in short memo fields | Workspace, Banking, Slack |
 | `chat_template_abuse` | File content | Workspace, Banking, Slack (empirically uncertain everywhere - §2.6) |
 
-Target ~20-25 total payloads across these six categories, weighted toward `direct_override`, `role_play_persona`, and `encoding_obfuscation` as the categories with the clearest, most-evidenced technique base across sources - and correspondingly lighter on `chat_template_abuse` given its documented empirical uncertainty above.
+The resulting corpus has 19 payloads across five empirically instantiated categories. It remains weighted toward `direct_override`, `role_play_persona`, and `encoding_obfuscation`; `multi_step_sleeper` is documented but excluded rather than represented by a fake second stage.
+
+**Installed-benchmark limitation:** Slack tools can retrieve channel and inbox messages, but AgentDojo v1.2.2 provides no native injection placeholder inside a message body. Its `prompt_injection_channel` placeholder changes a channel name, while `injection_dora_0` and `injection_phishing_1` are webpage content. The recorded corpus therefore uses Slack `web_content`; a message-body stratum would require a separate custom suite extension.
 
 ---
 
