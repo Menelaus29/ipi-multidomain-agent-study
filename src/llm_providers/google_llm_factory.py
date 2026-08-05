@@ -94,6 +94,10 @@ MAX_RPM_RETRIES = 2
 MAX_TRANSIENT_RETRIES = 2
 
 
+class RequestBudgetExceeded(RuntimeError):
+    """Raised before an API call would exceed a configured process budget."""
+
+
 class RequestRateLimiter:
     """Serialize request starts and expose process-local attempt accounting."""
 
@@ -101,12 +105,16 @@ class RequestRateLimiter:
         self,
         min_interval_seconds: float,
         *,
+        max_requests: int | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if min_interval_seconds < 0:
             raise ValueError("min_interval_seconds cannot be negative")
+        if max_requests is not None and max_requests < 0:
+            raise ValueError("max_requests cannot be negative")
         self.min_interval_seconds = min_interval_seconds
+        self._max_requests = max_requests
         self._clock = clock
         self._sleeper = sleeper
         self._next_request_at = 0.0
@@ -116,6 +124,14 @@ class RequestRateLimiter:
     def wait_before_request(self) -> None:
         """Wait until the next permitted start time and count the attempt."""
         with self._lock:
+            if (
+                self._max_requests is not None
+                and self._requests_started >= self._max_requests
+            ):
+                raise RequestBudgetExceeded(
+                    "Configured Gemini request-attempt budget exhausted "
+                    f"({self._requests_started}/{self._max_requests})"
+                )
             delay = self._next_request_at - self._clock()
             if delay > 0:
                 self._sleeper(delay)
@@ -127,6 +143,17 @@ class RequestRateLimiter:
         """Prevent any request from starting until at least ``seconds`` later."""
         with self._lock:
             self._next_request_at = max(self._next_request_at, self._clock() + seconds)
+
+    def set_max_requests(self, max_requests: int | None) -> None:
+        """Set an absolute process-local request ceiling without resetting usage."""
+        if max_requests is not None and max_requests < 0:
+            raise ValueError("max_requests cannot be negative")
+        with self._lock:
+            if max_requests is not None and max_requests < self._requests_started:
+                raise ValueError(
+                    "max_requests cannot be less than requests already started"
+                )
+            self._max_requests = max_requests
 
     @property
     def requests_started(self) -> int:
@@ -140,6 +167,11 @@ _REQUEST_RATE_LIMITER = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
 def get_google_request_attempt_count() -> int:
     """Return Gemini request attempts started by this Python process."""
     return _REQUEST_RATE_LIMITER.requests_started
+
+
+def configure_google_request_attempt_limit(max_requests: int | None) -> None:
+    """Prevent this process from starting more than ``max_requests`` API calls."""
+    _REQUEST_RATE_LIMITER.set_max_requests(max_requests)
 
 
 def classify_quota_error(

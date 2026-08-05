@@ -15,6 +15,7 @@ from src.llm_providers.google_llm_factory import (
     PRIMARY_RPM_LIMIT,
     PRIMARY_TPM_LIMIT,
     Gemini3LLM,
+    RequestBudgetExceeded,
     RequestRateLimiter,
     classify_quota_error,
 )
@@ -71,6 +72,22 @@ class GoogleLLMFactoryTests(unittest.TestCase):
         self.assertEqual("gemini-3.5-flash-lite", PRIMARY_MODEL)
         self.assertEqual("gemini-3.1-flash-lite", FALLBACK_MODEL)
         self.assertEqual((15, 250_000, 500), (PRIMARY_RPM_LIMIT, PRIMARY_TPM_LIMIT, PRIMARY_RPD_LIMIT))
+
+    def test_request_budget_stops_before_an_excess_api_call(self) -> None:
+        fake_time = _FakeTime()
+        limiter = RequestRateLimiter(
+            0.0,
+            max_requests=2,
+            clock=fake_time.monotonic,
+            sleeper=fake_time.sleep,
+        )
+
+        limiter.wait_before_request()
+        limiter.wait_before_request()
+        with self.assertRaises(RequestBudgetExceeded):
+            limiter.wait_before_request()
+
+        self.assertEqual(2, limiter.requests_started)
 
     def test_defer_extends_the_next_request_wait(self) -> None:
         fake_time = _FakeTime()

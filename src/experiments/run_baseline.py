@@ -50,6 +50,8 @@ from google.genai.errors import ClientError
 
 from src.llm_providers.google_llm_factory import (
     PRIMARY_MODEL,
+    RequestBudgetExceeded,
+    configure_google_request_attempt_limit,
     get_google_primary_llm,
     get_google_request_attempt_count,
 )
@@ -347,7 +349,11 @@ def _vector_from_notes(notes: str) -> str | None:
 def is_quota_exhausted(error: Exception) -> bool:
     """Return whether a Google API error represents a quota/rate-limit stop."""
     message = str(error).lower()
-    return getattr(error, "code", None) == 429 or "429" in message
+    return (
+        isinstance(error, RequestBudgetExceeded)
+        or getattr(error, "code", None) == 429
+        or "429" in message
+    )
 
 
 def attack_succeeded(injection_task_result: bool) -> bool:
@@ -455,6 +461,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="matrix breadth; stratified is the documented Phase 6 scope",
     )
     parser.add_argument("--max-runs", type=int, help="Stop after this many new task attempts")
+    parser.add_argument(
+        "--max-api-requests",
+        type=int,
+        help=(
+            "Hard process-local Gemini request-attempt ceiling; the runner stops "
+            "before starting a request beyond this budget"
+        ),
+    )
     parser.add_argument("--domain", action="append", choices=("workspace", "banking", "slack"), help="Restrict to a domain; repeatable")
     parser.add_argument("--payload-id", action="append", help="Restrict to a corpus payload ID; repeatable")
     parser.add_argument("--injection-task", action="append", help="Restrict to an AgentDojo injection task ID; repeatable")
@@ -466,6 +480,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.max_runs is not None and args.max_runs < 1:
         raise SystemExit("--max-runs must be at least 1")
+    if args.max_api_requests is not None and args.max_api_requests < 1:
+        raise SystemExit("--max-api-requests must be at least 1")
     payloads = load_corpus()
     cases = list(
         iter_cases(
@@ -486,6 +502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     results_path = args.results_path.resolve()
+    configure_google_request_attempt_limit(args.max_api_requests)
     completed = completed_cases(results_path)
     executed = 0
     session_requests_before = get_google_request_attempt_count()
@@ -498,11 +515,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         try:
             record = execute_case(payload, domain, vector, user_task_id, injection_task_id, results_path)
-        except ClientError as error:
+        except (ClientError, RequestBudgetExceeded) as error:
             if not is_quota_exhausted(error):
                 raise
             print(
-                "Stopping cleanly: Google API quota/rate limit reached. "
+                "Stopping cleanly: Google API quota/rate/request budget reached. "
                 f"{executed} completed case(s) remain checkpointed in {results_path}. "
                 f"This process started {get_google_request_attempt_count() - session_requests_before} "
                 "Gemini request attempt(s).",

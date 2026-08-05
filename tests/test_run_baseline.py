@@ -190,6 +190,11 @@ class RunBaselineTests(unittest.TestCase):
 
     def test_quota_detection_requires_a_google_429(self) -> None:
         self.assertTrue(run_baseline.is_quota_exhausted(Exception("429 RESOURCE_EXHAUSTED: quota exceeded")))
+        self.assertTrue(
+            run_baseline.is_quota_exhausted(
+                run_baseline.RequestBudgetExceeded("request budget exhausted")
+            )
+        )
         self.assertFalse(run_baseline.is_quota_exhausted(Exception("500 internal server error")))
 
     def test_quota_error_stops_cleanly_without_losing_prior_checkpoints(self) -> None:
