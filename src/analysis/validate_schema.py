@@ -1,11 +1,17 @@
 """Validate payload JSON or experiment JSONL records.
 
 Examples:
-    python -m src.analysis.validate_schema src/payloads/corpus.json --kind payload
-    python -m src.analysis.validate_schema data/baseline/results.jsonl --kind run
+    python -m src.analysis.validate_schema src/payloads/corpus.json --schema payload
+    python -m src.analysis.validate_schema data/baseline/results.jsonl --schema run
+    python -m src.analysis.validate_schema results.jsonl --schema calibrated-run
+    python -m src.analysis.validate_schema controls.jsonl --schema clean-control-run
+    python -m src.analysis.validate_schema attempts.jsonl --schema calibration-attempt
+    python -m src.analysis.validate_schema frozen_attacks.v1.json --schema frozen-attack
 
-With ``--kind auto`` (the default), a top-level JSON list is treated as a
-payload corpus and JSONL/single JSON objects are treated as run results.
+With ``--schema auto`` (the default), the schema is inferred from distinctive
+record fields. The legacy ``--kind`` spelling remains supported as an alias.
+Use ``calibrated-run`` for attack-bearing Phase 6A/defended results and
+``clean-control-run`` for pre-freeze no-injection utility controls.
 """
 
 from __future__ import annotations
@@ -14,9 +20,25 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
-from src.schemas import PayloadEntry, RunResult, SchemaValidationError
+from src.schemas import (
+    CalibrationAttempt,
+    FrozenAttack,
+    PayloadEntry,
+    RunResult,
+    SchemaValidationError,
+)
+
+
+SCHEMAS = {
+    "payload": PayloadEntry.from_dict,
+    "run": RunResult.from_dict,
+    "calibrated-run": RunResult.from_calibrated_dict,
+    "clean-control-run": RunResult.from_clean_control_dict,
+    "calibration-attempt": CalibrationAttempt.from_dict,
+    "frozen-attack": FrozenAttack.from_dict,
+}
 
 
 def _read_records(path: Path) -> tuple[list[Any], str]:
@@ -45,37 +67,52 @@ def _read_records(path: Path) -> tuple[list[Any], str]:
 
 
 def validate_file(path: Path, kind: str = "auto") -> int:
-    records, encoding = _read_records(path)
+    records, _ = _read_records(path)
     if kind == "auto":
-        kind = "payload" if encoding == "json" and _looks_like_payload_file(path, records) else "run"
-    if kind not in {"payload", "run"}:
-        raise SchemaValidationError(f"kind must be one of: auto, payload, run (got {kind!r})")
-    schema = PayloadEntry if kind == "payload" else RunResult
+        kind = _infer_schema(path, records)
+    if kind not in SCHEMAS:
+        choices = ", ".join(("auto", *SCHEMAS))
+        raise SchemaValidationError(f"schema must be one of: {choices} (got {kind!r})")
+    validator = SCHEMAS[kind]
     for index, record in enumerate(records, start=1):
-        schema.from_dict(record, path=f"{path}:{index}")
+        validator(record, path=f"{path}:{index}")
     print(f"OK: {path} ({len(records)} {kind} record(s))")
     return 0
 
 
-def _looks_like_payload_file(path: Path, records: Iterable[Any]) -> bool:
+def _infer_schema(path: Path, records: list[Any]) -> str:
     if path.name == "corpus.json":
-        return True
-    first = next(iter(records), None)
-    return isinstance(first, dict) and "template" in first and "payload_id" not in first
+        return "payload"
+    first = records[0] if records else None
+    if not isinstance(first, dict):
+        return "run"
+    if "attempt_id" in first:
+        return "calibration-attempt"
+    if (
+        "attack_id" in first
+        and "attack_set_version" in first
+        and "run_id" not in first
+    ):
+        return "frozen-attack"
+    if "id" in first and "template" in first and "payload_id" not in first:
+        return "payload"
+    return "run"
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path, help="JSON or JSONL file to validate")
     parser.add_argument(
+        "--schema",
         "--kind",
-        choices=("auto", "payload", "run"),
+        dest="schema",
+        choices=("auto", *SCHEMAS),
         default="auto",
-        help="record schema; auto infers corpus.json as payload and otherwise uses run",
+        help="record schema; auto infers it from distinctive record fields",
     )
     args = parser.parse_args(argv)
     try:
-        return validate_file(args.path, args.kind)
+        return validate_file(args.path, args.schema)
     except (OSError, SchemaValidationError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
