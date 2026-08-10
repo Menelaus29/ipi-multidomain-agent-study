@@ -1,4 +1,4 @@
-"""Dashboard-aware request quota guard for recorded Gemini experiments.
+"""Dashboard-aware request quota guard for recorded Google-model experiments.
 
 The guard reserves a conservative process budget in a persistent, Pacific-date
 ledger before an experiment can make its first API request. A cross-platform
@@ -29,6 +29,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from filelock import FileLock, Timeout
 
 from src.llm_providers.google_llm_factory import (
+    GEMMA4_26B_MODEL,
+    GEMMA4_26B_RPD_LIMIT,
+    PRIMARY_MODEL,
+    PRIMARY_RPD_LIMIT,
     configure_google_request_attempt_limit,
     get_google_request_attempt_count,
 )
@@ -37,11 +41,16 @@ from src.llm_providers.google_llm_factory import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_LEDGER_PATH = PROJECT_ROOT / "data" / "quota_ledger.jsonl"
 PACIFIC_TIME_ZONE = "America/Los_Angeles"
-STUDY_RPD_LIMIT = 500
+STUDY_RPD_LIMIT = PRIMARY_RPD_LIMIT
+DEFAULT_QUOTA_KEY = PRIMARY_MODEL
+STUDY_RPD_LIMITS = {
+    PRIMARY_MODEL: PRIMARY_RPD_LIMIT,
+    GEMMA4_26B_MODEL: GEMMA4_26B_RPD_LIMIT,
+}
 EXPERIMENT_RESERVE = 25
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
-_LEDGER_FIELDS = {
+_LEDGER_FIELDS_V1 = {
     "schema_version",
     "quota_date",
     "reserved_at",
@@ -56,6 +65,7 @@ _LEDGER_FIELDS = {
     "interruption_resolved_at",
     "resolution_dashboard_used",
 }
+_LEDGER_FIELDS = _LEDGER_FIELDS_V1 | {"quota_key", "study_rpd_limit"}
 
 
 class QuotaGuardError(RuntimeError):
@@ -89,13 +99,13 @@ def add_quota_arguments(
         "--dashboard-used",
         required=required,
         type=int,
-        help="Current Gemini RPD usage shown by the dashboard",
+        help="Current target-model RPD usage shown by the dashboard",
     )
     parser.add_argument(
         "--dashboard-limit",
         required=required,
         type=int,
-        help="Current Gemini RPD limit shown by the dashboard",
+        help="Current target-model RPD limit shown by the dashboard",
     )
     parser.add_argument(
         "--max-api-requests",
@@ -184,8 +194,19 @@ def _validate_ledger_record(record: object, line_number: int) -> dict[str, Any]:
     path = f"quota ledger line {line_number}"
     if not isinstance(record, Mapping):
         raise QuotaValidationError(f"{path} must be a JSON object")
-    missing = sorted(_LEDGER_FIELDS - set(record))
-    extra = sorted(set(record) - _LEDGER_FIELDS)
+    schema_version = _require_count(
+        record.get("schema_version"), f"{path}.schema_version"
+    )
+    if schema_version == 1:
+        expected_fields = _LEDGER_FIELDS_V1
+    elif schema_version == LEDGER_SCHEMA_VERSION:
+        expected_fields = _LEDGER_FIELDS
+    else:
+        raise QuotaValidationError(
+            f"{path}.schema_version must be 1 or {LEDGER_SCHEMA_VERSION}"
+        )
+    missing = sorted(expected_fields - set(record))
+    extra = sorted(set(record) - expected_fields)
     if missing or extra:
         detail = []
         if missing:
@@ -195,13 +216,23 @@ def _validate_ledger_record(record: object, line_number: int) -> dict[str, Any]:
         raise QuotaValidationError(f"{path} has invalid fields: {'; '.join(detail)}")
 
     validated = dict(record)
-    schema_version = _require_count(
-        record["schema_version"], f"{path}.schema_version"
-    )
-    if schema_version != LEDGER_SCHEMA_VERSION:
-        raise QuotaValidationError(
-            f"{path}.schema_version must be {LEDGER_SCHEMA_VERSION}"
+    if schema_version == 1:
+        # Every v1 record predates the Gemma study arm and therefore belongs to
+        # Gemini 3.5 Flash-Lite. Normalize in memory; the next atomic ledger
+        # write migrates it to the model-aware v2 representation.
+        validated.update(
+            schema_version=LEDGER_SCHEMA_VERSION,
+            quota_key=DEFAULT_QUOTA_KEY,
+            study_rpd_limit=STUDY_RPD_LIMIT,
         )
+    record = validated
+
+    quota_key = record["quota_key"]
+    if not isinstance(quota_key, str) or not quota_key.strip():
+        raise QuotaValidationError(f"{path}.quota_key must be a nonempty string")
+    _require_count(
+        record["study_rpd_limit"], f"{path}.study_rpd_limit", positive=True
+    )
     quota_date = record["quota_date"]
     if not isinstance(quota_date, str):
         raise QuotaValidationError(f"{path}.quota_date must use YYYY-MM-DD")
@@ -250,7 +281,7 @@ def _validate_ledger_record(record: object, line_number: int) -> dict[str, Any]:
         raise QuotaValidationError(
             f"{path}.dashboard_used cannot exceed dashboard_limit"
         )
-    if record["effective_limit"] > STUDY_RPD_LIMIT:
+    if record["effective_limit"] > record["study_rpd_limit"]:
         raise QuotaValidationError(
             f"{path}.effective_limit exceeds the study ceiling"
         )
@@ -339,19 +370,22 @@ def _record_used_ceiling(record: Mapping[str, Any]) -> int:
     return known_before + int(record["reserved_attempts"])
 
 
-def _ledger_known_used(records: Sequence[Mapping[str, Any]], quota_date: str) -> int:
+def _ledger_known_used(
+    records: Sequence[Mapping[str, Any]], quota_date: str, quota_key: str
+) -> int:
     return max(
         (
             _record_used_ceiling(record)
             for record in records
             if record["quota_date"] == quota_date
+            and record["quota_key"] == quota_key
         ),
         default=0,
     )
 
 
 class QuotaGuard(AbstractContextManager["QuotaGuard"]):
-    """Reserve, enforce, and reconcile one process's Gemini request budget."""
+    """Reserve, enforce, and reconcile one model-specific request budget."""
 
     def __init__(
         self,
@@ -360,6 +394,8 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
         dashboard_used: int,
         dashboard_limit: int,
         max_api_requests: int,
+        quota_key: str = DEFAULT_QUOTA_KEY,
+        study_rpd_limit: int = STUDY_RPD_LIMIT,
         ledger_path: Path = DEFAULT_LEDGER_PATH,
         now_utc: Callable[[], datetime] | None = None,
         configure_attempt_limit: Callable[[int | None], None] = (
@@ -372,6 +408,8 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
         self.dashboard_used = dashboard_used
         self.dashboard_limit = dashboard_limit
         self.max_api_requests = max_api_requests
+        self.quota_key = quota_key
+        self.study_rpd_limit = study_rpd_limit
         self.ledger_path = Path(ledger_path)
         self.lock_path = self.ledger_path.with_name(self.ledger_path.name + ".lock")
         self._now_utc = now_utc or (lambda: datetime.now(timezone.utc))
@@ -418,6 +456,11 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
         requested_cap = _require_count(
             self.max_api_requests, "max_api_requests", positive=True
         )
+        if not isinstance(self.quota_key, str) or not self.quota_key.strip():
+            raise QuotaValidationError("quota_key must be a nonempty string")
+        study_rpd_limit = _require_count(
+            self.study_rpd_limit, "study_rpd_limit", positive=True
+        )
         if dashboard_used > dashboard_limit:
             raise QuotaValidationError(
                 "dashboard_used cannot exceed dashboard_limit"
@@ -442,6 +485,7 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
             for record in records:
                 if (
                     record["quota_date"] == quota_date
+                    and record["quota_key"] == self.quota_key
                     and _is_open_reservation(record)
                 ):
                     record["interruption_resolved_at"] = timestamp
@@ -450,8 +494,8 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
             if resolved_any:
                 _write_ledger_atomic(self.ledger_path, records)
 
-            effective_limit = min(STUDY_RPD_LIMIT, dashboard_limit)
-            ledger_used = _ledger_known_used(records, quota_date)
+            effective_limit = min(study_rpd_limit, dashboard_limit)
+            ledger_used = _ledger_known_used(records, quota_date, self.quota_key)
             known_used = max(dashboard_used, ledger_used)
             available = effective_limit - known_used - EXPERIMENT_RESERVE
             effective_cap = min(requested_cap, available)
@@ -468,7 +512,7 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
             self._configure_attempt_limit(attempts_before + effective_cap)
 
             print(
-                "Gemini quota budget: "
+                f"Google quota budget ({self.quota_key}): "
                 f"requested={requested_cap}, effective={effective_cap}, "
                 f"daily_limit={effective_limit}, known_used={known_used}, "
                 f"reserve={EXPERIMENT_RESERVE}",
@@ -477,6 +521,8 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
 
             record = {
                 "schema_version": LEDGER_SCHEMA_VERSION,
+                "quota_key": self.quota_key,
+                "study_rpd_limit": study_rpd_limit,
                 "quota_date": quota_date,
                 "reserved_at": timestamp,
                 "dashboard_used": dashboard_used,
@@ -508,22 +554,27 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
         if not self._entered:
             return False
         try:
-            if exc_type is None:
-                if self._attempts_before is None or self._record_index is None:
-                    raise QuotaGuardError("QuotaGuard reconciliation state is incomplete")
-                attempts_after = _require_count(
-                    self._get_attempt_count(), "process request-attempt count"
+            if self._attempts_before is None or self._record_index is None:
+                raise QuotaGuardError("QuotaGuard reconciliation state is incomplete")
+            attempts_after = _require_count(
+                self._get_attempt_count(), "process request-attempt count"
+            )
+            actual_attempts = attempts_after - self._attempts_before
+            if actual_attempts < 0:
+                raise QuotaGuardError(
+                    "Process request-attempt count decreased during the guarded run"
                 )
-                actual_attempts = attempts_after - self._attempts_before
-                if actual_attempts < 0:
-                    raise QuotaGuardError(
-                        "Process request-attempt count decreased during the guarded run"
-                    )
-                if actual_attempts > self.effective_cap:
-                    raise QuotaGuardError(
-                        "Process exceeded its reserved request-attempt cap"
-                    )
+            if actual_attempts > self.effective_cap:
+                raise QuotaGuardError(
+                    "Process exceeded its reserved request-attempt cap"
+                )
 
+            # A deterministic validation failure discovered after acquiring the
+            # experiment lock made no provider request and therefore must not
+            # strand the conservative reservation.  Once any request has
+            # started, retain the open reservation on exceptional exit so the
+            # existing interruption-recovery accounting remains conservative.
+            if exc_type is None or actual_attempts == 0:
                 records = _read_ledger(self.ledger_path)
                 if self._record_index >= len(records):
                     raise QuotaGuardError("Quota reservation disappeared from the ledger")
@@ -544,6 +595,8 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
 def quota_guard_from_args(
     args: argparse.Namespace,
     *,
+    quota_key: str = DEFAULT_QUOTA_KEY,
+    study_rpd_limit: int | None = None,
     ledger_path: Path = DEFAULT_LEDGER_PATH,
     now_utc: Callable[[], datetime] | None = None,
     configure_attempt_limit: Callable[[int | None], None] = (
@@ -566,14 +619,40 @@ def quota_guard_from_args(
         raise QuotaValidationError(
             f"API execution requires quota argument(s): {rendered}"
         )
+    validate_quota_count_args(args)
+    resolved_study_limit = (
+        study_rpd_limit
+        if study_rpd_limit is not None
+        else STUDY_RPD_LIMITS.get(quota_key)
+    )
+    if resolved_study_limit is None:
+        raise QuotaValidationError(
+            f"No study RPD ceiling is registered for quota key {quota_key!r}"
+        )
     return QuotaGuard(
         quota_date=args.quota_date,
         dashboard_used=args.dashboard_used,
         dashboard_limit=args.dashboard_limit,
         max_api_requests=args.max_api_requests,
+        quota_key=quota_key,
+        study_rpd_limit=resolved_study_limit,
         ledger_path=ledger_path,
         now_utc=now_utc,
         configure_attempt_limit=configure_attempt_limit,
         get_attempt_count=get_attempt_count,
         output=output,
     )
+
+
+def validate_quota_count_args(args: argparse.Namespace) -> None:
+    """Validate immutable CLI quota counts without locking or writing a ledger."""
+
+    dashboard_used = _require_count(args.dashboard_used, "dashboard_used")
+    dashboard_limit = _require_count(
+        args.dashboard_limit, "dashboard_limit", positive=True
+    )
+    _require_count(args.max_api_requests, "max_api_requests", positive=True)
+    if dashboard_used > dashboard_limit:
+        raise QuotaValidationError(
+            "dashboard_used cannot exceed dashboard_limit"
+        )

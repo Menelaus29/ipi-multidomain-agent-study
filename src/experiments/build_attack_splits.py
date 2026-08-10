@@ -48,6 +48,16 @@ DEFAULT_HOLDOUT_OUTPUT = (
     PROJECT_ROOT / "data" / "attack_calibration" / "holdout_candidates.tsv"
 )
 
+# Prospective candidate-pool hashes committed in Phase 6A.7 and recorded in
+# docs/baseline_null_analysis.md.  Runtime consumers use these values to reject
+# a silently edited/reordered canonical source manifest.  A new candidate-pool
+# version must use new paths and hashes rather than changing these constants in
+# place after calibration has begun.
+COMMITTED_CANDIDATE_SHA256 = {
+    "dev": "1b5e2542ba5fc20ad04b5b8062e9150a8ce1a4c85231653255991f17446cf725",
+    "holdout": "08ecfcb1c5b95ba59753c4e4ffa6dc8c228f9e51bc1029fc7316565e7178882a",
+}
+
 BASELINE_COLUMNS = (
     "payload_id",
     "domain",

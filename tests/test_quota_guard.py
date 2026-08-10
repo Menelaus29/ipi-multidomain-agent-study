@@ -22,6 +22,9 @@ from src.experiments.quota_guard import (
     quota_guard_from_args,
 )
 from src.llm_providers.google_llm_factory import (
+    GEMMA4_26B_MODEL,
+    GEMMA4_26B_RPD_LIMIT,
+    PRIMARY_MODEL,
     Gemini3LLM,
     RequestBudgetExceeded,
     RequestRateLimiter,
@@ -157,6 +160,8 @@ class QuotaGuardTests(unittest.TestCase):
         dashboard_used: int = 0,
         dashboard_limit: int = 500,
         max_api_requests: int = 100,
+        quota_key: str = PRIMARY_MODEL,
+        study_rpd_limit: int = 500,
         output: StringIO | None = None,
     ) -> QuotaGuard:
         return QuotaGuard(
@@ -164,6 +169,8 @@ class QuotaGuardTests(unittest.TestCase):
             dashboard_used=dashboard_used,
             dashboard_limit=dashboard_limit,
             max_api_requests=max_api_requests,
+            quota_key=quota_key,
+            study_rpd_limit=study_rpd_limit,
             ledger_path=self.ledger,
             now_utc=lambda: FIXED_NOW,
             configure_attempt_limit=self.attempts.configure,
@@ -192,6 +199,7 @@ class QuotaGuardTests(unittest.TestCase):
                 with self.assertRaises(QuotaValidationError):
                     with self.guard(**values):
                         pass
+                self.assertFalse(self.ledger.exists())
 
     def test_rejects_nonpositive_safe_budget(self) -> None:
         with self.assertRaisesRegex(QuotaValidationError, "No positive"):
@@ -269,12 +277,79 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertIsNotNone(resolved[0]["interruption_resolved_at"])
         self.assertEqual(37, resolved[0]["resolution_dashboard_used"])
 
+    def test_zero_attempt_exception_reconciles_without_stranding_reservation(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "validation failed"):
+            with self.guard(dashboard_used=30, max_api_requests=100):
+                raise RuntimeError("validation failed")
+
+        record = _records(self.ledger)[0]
+        self.assertEqual(0, record["actual_attempts"])
+        self.assertIsNotNone(record["reconciled_at"])
+        self.assertIsNone(record["interruption_resolved_at"])
+
+    def test_exception_after_attempt_retains_conservative_reservation(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            with self.guard(dashboard_used=30, max_api_requests=100):
+                self.attempts.count += 1
+                raise RuntimeError("interrupted")
+
+        record = _records(self.ledger)[0]
+        self.assertIsNone(record["actual_attempts"])
+        self.assertIsNone(record["reconciled_at"])
+
     def test_lock_contention_rejects_a_second_process_session(self) -> None:
         first = self.guard(max_api_requests=50)
         with first:
             with self.assertRaises(ConcurrentQuotaRunError):
                 with self.guard(max_api_requests=50):
                     pass
+
+    def test_model_keys_do_not_share_daily_usage_or_reservations(self) -> None:
+        with self.guard(dashboard_used=100, max_api_requests=100):
+            self.attempts.count += 20
+
+        with self.guard(
+            dashboard_used=0,
+            dashboard_limit=GEMMA4_26B_RPD_LIMIT,
+            max_api_requests=1_000,
+            quota_key=GEMMA4_26B_MODEL,
+            study_rpd_limit=GEMMA4_26B_RPD_LIMIT,
+        ) as gemma:
+            self.assertEqual(0, gemma.known_used)
+            self.assertEqual(GEMMA4_26B_RPD_LIMIT, gemma.effective_limit)
+            self.assertEqual(1_000, gemma.effective_cap)
+
+        records = _records(self.ledger)
+        self.assertEqual(
+            [PRIMARY_MODEL, GEMMA4_26B_MODEL],
+            [record["quota_key"] for record in records],
+        )
+
+    def test_v1_ledger_records_migrate_as_primary_model_records(self) -> None:
+        legacy = {
+            "schema_version": 1,
+            "quota_date": FIXED_DATE,
+            "reserved_at": FIXED_NOW.isoformat(),
+            "dashboard_used": 10,
+            "dashboard_limit": 500,
+            "effective_limit": 500,
+            "known_used_before": 10,
+            "requested_cap": 20,
+            "reserved_attempts": 20,
+            "reconciled_at": FIXED_NOW.isoformat(),
+            "actual_attempts": 5,
+            "interruption_resolved_at": None,
+            "resolution_dashboard_used": None,
+        }
+        self.ledger.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+        with self.guard(dashboard_used=15, max_api_requests=10):
+            pass
+
+        records = _records(self.ledger)
+        self.assertTrue(all(record["schema_version"] == 2 for record in records))
+        self.assertEqual(PRIMARY_MODEL, records[0]["quota_key"])
+        self.assertEqual(500, records[0]["study_rpd_limit"])
 
     def test_ledger_contains_only_quota_metadata(self) -> None:
         with self.guard(max_api_requests=50):
@@ -283,6 +358,8 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertEqual(
             {
                 "schema_version",
+                "quota_key",
+                "study_rpd_limit",
                 "quota_date",
                 "reserved_at",
                 "dashboard_used",

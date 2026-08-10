@@ -9,6 +9,11 @@ from google.genai.errors import ClientError
 
 from src.llm_providers.google_llm_factory import (
     FALLBACK_MODEL,
+    GEMMA4_26B_MODEL,
+    GEMMA4_26B_RPD_LIMIT,
+    GEMMA4_26B_RPM_LIMIT,
+    GEMMA4_26B_TPM_LIMIT,
+    GEMMA4_TOKEN_SAFETY_TARGET,
     HTTP_REQUEST_TIMEOUT_MS,
     MIN_REQUEST_INTERVAL_SECONDS,
     PRIMARY_MODEL,
@@ -18,6 +23,8 @@ from src.llm_providers.google_llm_factory import (
     Gemini3LLM,
     RequestBudgetExceeded,
     RequestRateLimiter,
+    TokenWindowPacer,
+    approximate_request_tokens,
     classify_quota_error,
 )
 
@@ -73,6 +80,12 @@ class GoogleLLMFactoryTests(unittest.TestCase):
         self.assertEqual("gemini-3.5-flash-lite", PRIMARY_MODEL)
         self.assertEqual("gemini-3.1-flash-lite", FALLBACK_MODEL)
         self.assertEqual((15, 250_000, 500), (PRIMARY_RPM_LIMIT, PRIMARY_TPM_LIMIT, PRIMARY_RPD_LIMIT))
+        self.assertEqual("gemma-4-26b-a4b-it", GEMMA4_26B_MODEL)
+        self.assertEqual(
+            (30, 16_000, 14_400),
+            (GEMMA4_26B_RPM_LIMIT, GEMMA4_26B_TPM_LIMIT, GEMMA4_26B_RPD_LIMIT),
+        )
+        self.assertEqual(14_000, GEMMA4_TOKEN_SAFETY_TARGET)
         self.assertEqual(120_000, HTTP_REQUEST_TIMEOUT_MS)
 
     def test_request_budget_stops_before_an_excess_api_call(self) -> None:
@@ -105,7 +118,7 @@ class GoogleLLMFactoryTests(unittest.TestCase):
 
         self.assertEqual([65.0], fake_time.sleeps)
 
-    def test_quota_classifier_distinguishes_minute_and_day_metrics(self) -> None:
+    def test_quota_classifier_distinguishes_request_token_and_day_metrics(self) -> None:
         rpm = ClientError(
             429,
             {"error": {"status": "RESOURCE_EXHAUSTED", "details": [
@@ -118,9 +131,16 @@ class GoogleLLMFactoryTests(unittest.TestCase):
                 {"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}
             ]}},
         )
+        tpm = ClientError(
+            429,
+            {"error": {"status": "RESOURCE_EXHAUSTED", "details": [
+                {"quotaId": "GenerateContentInputTokensPerModelPerMinute-FreeTier"}
+            ]}},
+        )
         unknown = ClientError(429, {"error": {"status": "RESOURCE_EXHAUSTED"}})
 
         self.assertEqual("rpm", classify_quota_error(rpm))
+        self.assertEqual("tpm", classify_quota_error(tpm))
         self.assertEqual("rpd", classify_quota_error(rpd))
         self.assertEqual("unknown", classify_quota_error(unknown))
 
@@ -168,6 +188,54 @@ class GoogleLLMFactoryTests(unittest.TestCase):
 
         self.assertEqual(1, client.models.calls)
         self.assertEqual([], fake_time.sleeps)
+
+    def test_tpm_error_waits_and_retries_with_the_rpm_bound(self) -> None:
+        fake_time = _FakeTime()
+        limiter = RequestRateLimiter(
+            0.0,
+            clock=fake_time.monotonic,
+            sleeper=fake_time.sleep,
+        )
+        tpm = ClientError(
+            429,
+            {"error": {"status": "RESOURCE_EXHAUSTED", "details": [
+                {"quotaId": "GenerateTokensPerMinutePerProjectPerModel-FreeTier"}
+            ]}},
+        )
+        expected = object()
+        client = _FakeClient([tpm, expected])
+        llm = Gemini3LLM("test-model", client, rate_limiter=limiter)  # type: ignore[arg-type]
+
+        actual = llm._generate_content([], genai_types.GenerateContentConfig())
+
+        self.assertIs(expected, actual)
+        self.assertEqual(2, client.models.calls)
+        self.assertEqual([65.0], fake_time.sleeps)
+
+    def test_token_window_pacer_waits_before_cumulative_limit(self) -> None:
+        fake_time = _FakeTime()
+        pacer = TokenWindowPacer(
+            10_000,
+            window_seconds=60.0,
+            clock=fake_time.monotonic,
+            sleeper=fake_time.sleep,
+        )
+
+        self.assertEqual(0.0, pacer.wait_before_tokens(6_000))
+        self.assertEqual(60.0, pacer.wait_before_tokens(5_000))
+        self.assertEqual([60.0], fake_time.sleeps)
+
+    def test_request_token_estimate_includes_messages_and_tools_without_mutation(self) -> None:
+        messages = [genai_types.Content(role="user", parts=[genai_types.Part(text="x" * 900)])]
+        config = genai_types.GenerateContentConfig(
+            tools=[genai_types.Tool(function_declarations=[])]
+        )
+        before = repr(messages)
+
+        estimate = approximate_request_tokens(messages, config)
+
+        self.assertGreater(estimate, 256)
+        self.assertEqual(before, repr(messages))
 
 
 if __name__ == "__main__":

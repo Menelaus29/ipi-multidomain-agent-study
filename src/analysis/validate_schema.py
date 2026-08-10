@@ -6,6 +6,8 @@ Examples:
     python -m src.analysis.validate_schema results.jsonl --schema calibrated-run
     python -m src.analysis.validate_schema controls.jsonl --schema clean-control-run
     python -m src.analysis.validate_schema attempts.jsonl --schema calibration-attempt
+    python -m src.analysis.validate_schema generator_attempts.jsonl --schema v2-generator-attempt
+    python -m src.analysis.validate_schema goal_controls.jsonl --schema goal-achievability-control
     python -m src.analysis.validate_schema frozen_attacks.v1.json --schema frozen-attack
 
 With ``--schema auto`` (the default), the schema is inferred from distinctive
@@ -25,9 +27,11 @@ from typing import Any
 from src.schemas import (
     CalibrationAttempt,
     FrozenAttack,
+    GoalAchievabilityControl,
     PayloadEntry,
     RunResult,
     SchemaValidationError,
+    V2GeneratorAttempt,
 )
 
 
@@ -37,6 +41,8 @@ SCHEMAS = {
     "calibrated-run": RunResult.from_calibrated_dict,
     "clean-control-run": RunResult.from_clean_control_dict,
     "calibration-attempt": CalibrationAttempt.from_dict,
+    "v2-generator-attempt": V2GeneratorAttempt.from_dict,
+    "goal-achievability-control": GoalAchievabilityControl.from_dict,
     "frozen-attack": FrozenAttack.from_dict,
 }
 
@@ -86,6 +92,10 @@ def _infer_schema(path: Path, records: list[Any]) -> str:
     first = records[0] if records else None
     if not isinstance(first, dict):
         return "run"
+    if "generation_id" in first and "attack_set_version" in first:
+        return "v2-generator-attempt"
+    if "control_id" in first and "attack_set_version" in first:
+        return "goal-achievability-control"
     if "attempt_id" in first:
         return "calibration-attempt"
     if (
