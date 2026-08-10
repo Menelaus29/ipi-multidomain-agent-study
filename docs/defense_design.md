@@ -35,8 +35,10 @@ steps in order:
 2. Within each resulting line, replace characters from left to right:
    backslash with `\\`, carriage return with `\r`, tab with `\t`, and every
    other ASCII control character U+0000–U+001F or U+007F with lowercase
-   `\uXXXX`. LF is already represented by the line split. Leave every other
-   Unicode character unchanged.
+   `\uXXXX`. Also encode Unicode next-line U+0085, line separator U+2028, and
+   paragraph separator U+2029 as lowercase `\uXXXX`, so only LF can create a
+   visible line boundary. LF is already represented by the line split. Leave
+   every other Unicode character unchanged.
 3. Prefix every encoded line, including an empty line, with the six-character
    string `DATA| `.
 4. Join the prefixed lines with LF.

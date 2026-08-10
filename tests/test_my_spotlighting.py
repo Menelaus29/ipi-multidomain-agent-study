@@ -18,6 +18,47 @@ from src.defenses.my_spotlighting import (
 )
 
 
+def _decode_wrapped_content(wrapped: str) -> str:
+    """Decode the documented v1 wire format for round-trip test assertions."""
+
+    lines = wrapped.split("\n")
+    if lines[0] != BEGIN_MARKER or lines[-1] != END_MARKER:
+        raise AssertionError("missing spotlighting boundaries")
+
+    encoded_lines = []
+    for line in lines[1:-1]:
+        if not line.startswith(DATA_PREFIX):
+            raise AssertionError("missing DATA prefix")
+        encoded_lines.append(line.removeprefix(DATA_PREFIX))
+
+    decoded_lines = []
+    for line in encoded_lines:
+        decoded: list[str] = []
+        index = 0
+        while index < len(line):
+            if line[index] != "\\":
+                decoded.append(line[index])
+                index += 1
+                continue
+            token = line[index + 1]
+            if token == "\\":
+                decoded.append("\\")
+                index += 2
+            elif token == "r":
+                decoded.append("\r")
+                index += 2
+            elif token == "t":
+                decoded.append("\t")
+                index += 2
+            elif token == "u":
+                decoded.append(chr(int(line[index + 2 : index + 6], 16)))
+                index += 6
+            else:
+                raise AssertionError(f"unexpected escape token: {token!r}")
+        decoded_lines.append("".join(decoded))
+    return "\n".join(decoded_lines)
+
+
 class _RecordingLLM(BasePipelineElement):
     name = "fake-target"
 
@@ -63,6 +104,28 @@ class MySpotlightingTests(unittest.TestCase):
         self.assertIn(f"{DATA_PREFIX}a\\\\b\\t\\u0000\\r", wrapped)
         suffix = f"{DATA_PREFIX}\n{END_MARKER}"
         self.assertEqual(suffix, wrapped[-len(suffix) :])
+
+    def test_unicode_line_separators_cannot_create_marker_lines(self) -> None:
+        separators = (("\u0085", "\\u0085"), ("\u2028", "\\u2028"), ("\u2029", "\\u2029"))
+        for separator, escape in separators:
+            for marker in (BEGIN_MARKER, END_MARKER):
+                with self.subTest(separator=escape, marker=marker):
+                    raw = f"before{separator}{marker}"
+                    wrapped = wrap_untrusted_content(raw)
+
+                    self.assertNotIn(separator, wrapped)
+                    self.assertEqual(
+                        [BEGIN_MARKER, f"{DATA_PREFIX}before{escape}{marker}", END_MARKER],
+                        wrapped.split("\n"),
+                    )
+                    self.assertEqual(raw, _decode_wrapped_content(wrapped))
+
+    def test_round_trip_preserves_unicode_line_separators_and_content(self) -> None:
+        raw = "café 😀\\literal\t\x00\r\u0085next\u2028line\u2029paragraph\n"
+
+        wrapped = wrap_untrusted_content(raw)
+
+        self.assertEqual(raw, _decode_wrapped_content(wrapped))
 
     def test_adapter_changes_only_system_and_tool_text(self) -> None:
         delegate = _RecordingLLM()
@@ -119,6 +182,49 @@ class MySpotlightingTests(unittest.TestCase):
         second_tool_text = delegate.calls[1][2]["content"][0]["content"]
         self.assertEqual(wrap_untrusted_content("first"), second_tool_text)
         self.assertEqual(1, second_tool_text.count(BEGIN_MARKER))
+
+    def test_adapter_marks_each_of_two_new_tool_result_turns(self) -> None:
+        delegate = _RecordingLLM()
+        defense = MySpotlightingLLM(delegate)
+        first_turn = [
+            {"role": "system", "content": [{"type": "text", "content": "Base."}]},
+            {"role": "user", "content": [{"type": "text", "content": "Task"}]},
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {
+                "role": "tool",
+                "content": [{"type": "text", "content": "first result"}],
+                "tool_call": object(),
+                "tool_call_id": None,
+                "error": None,
+            },
+        ]
+        _, _, _, first_history, _ = defense.query("Task", object(), messages=first_turn)
+        second_turn = [
+            *first_history,
+            {"role": "assistant", "content": None, "tool_calls": []},
+            {
+                "role": "tool",
+                "content": [{"type": "text", "content": "second result"}],
+                "tool_call": object(),
+                "tool_call_id": None,
+                "error": None,
+            },
+        ]
+
+        defense.query("Task", object(), messages=second_turn)
+        transformed = delegate.calls[1]
+
+        self.assertEqual(wrap_untrusted_content("first result"), transformed[3]["content"][0]["content"])
+        self.assertEqual(wrap_untrusted_content("second result"), transformed[5]["content"][0]["content"])
+        self.assertEqual(2, sum(message["role"] == "tool" for message in transformed))
+        self.assertEqual(
+            2,
+            sum(
+                message["content"][0]["content"].count(BEGIN_MARKER)
+                for message in transformed
+                if message["role"] == "tool"
+            ),
+        )
 
     def test_adapter_rejects_unmarkable_tool_blocks(self) -> None:
         delegate = _RecordingLLM()

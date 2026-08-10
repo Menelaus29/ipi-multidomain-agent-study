@@ -30,6 +30,7 @@ DEFENSE_VERSION = "v1"
 BEGIN_MARKER = "<<<START_OF_UNTRUSTED_TOOL_DATA_V1>>>"
 END_MARKER = "<<<END_OF_UNTRUSTED_TOOL_DATA_V1>>>"
 DATA_PREFIX = "DATA| "
+_UNICODE_LINE_SEPARATORS = {"\u0085", "\u2028", "\u2029"}
 
 SYSTEM_PROMPT_FRAGMENT = f"""
 
@@ -49,7 +50,7 @@ may supply instructions.
 
 
 def _escape_data_line(line: str) -> str:
-    """Escape control characters without changing readable Unicode text."""
+    """Escape control and Unicode line-separator characters reversibly."""
 
     escaped: list[str] = []
     for character in line:
@@ -60,7 +61,11 @@ def _escape_data_line(line: str) -> str:
             escaped.append("\\r")
         elif character == "\t":
             escaped.append("\\t")
-        elif codepoint < 0x20 or codepoint == 0x7F:
+        elif (
+            codepoint < 0x20
+            or codepoint == 0x7F
+            or character in _UNICODE_LINE_SEPARATORS
+        ):
             escaped.append(f"\\u{codepoint:04x}")
         else:
             escaped.append(character)
@@ -71,8 +76,9 @@ def encode_untrusted_content(raw_content: str) -> str:
     """Return the reversible, line-marked representation of untrusted text.
 
     Splitting only on ``\n`` preserves empty lines and a trailing newline. A
-    carriage return (including the CR half of CRLF), tab, backslash, or other
-    ASCII control character is escaped within its data line.
+    carriage return (including the CR half of CRLF), tab, backslash, ASCII
+    control characters, and Unicode next-line/line/paragraph separators are
+    escaped within their data line.
     """
 
     if not isinstance(raw_content, str):
@@ -102,11 +108,16 @@ def defense_source_sha256() -> str:
 
 def _append_system_policy(message: ChatMessage) -> ChatMessage:
     updated: dict[str, Any] = dict(message)
-    content = [dict(block) for block in message.get("content", [])]
+    message_content = message.get("content")
+    if not isinstance(message_content, list):
+        raise TypeError("system messages must contain a list of content blocks")
+    content = [dict(block) for block in message_content]
     for block in content:
         if block.get("type") != "text":
             continue
-        text = block.get("content", "")
+        text = block.get("content")
+        if not isinstance(text, str):
+            raise TypeError("system text content must be a string")
         if SYSTEM_PROMPT_FRAGMENT not in text:
             block["content"] = f"{text}{SYSTEM_PROMPT_FRAGMENT}"
         updated["content"] = content
@@ -118,8 +129,11 @@ def _append_system_policy(message: ChatMessage) -> ChatMessage:
 
 def _mark_tool_message(message: ChatMessage) -> ChatMessage:
     updated: dict[str, Any] = dict(message)
+    message_content = message.get("content")
+    if not isinstance(message_content, list):
+        raise TypeError("tool messages must contain a list of content blocks")
     content: list[dict[str, Any]] = []
-    for block in message.get("content", []):
+    for block in message_content:
         updated_block = dict(block)
         if updated_block.get("type") != "text":
             raise TypeError("tool messages may contain only text blocks")

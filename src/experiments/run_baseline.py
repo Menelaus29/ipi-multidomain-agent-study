@@ -1122,13 +1122,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         quota_key=target.model_name,
         study_rpd_limit=target.rpd_limit,
     ):
-        return run_cases(
+        exit_code = run_cases(
             args,
             cases,
             target=target,
             results_path=results_path,
             raw_root=raw_root,
         )
+    return exit_code
 
 
 if __name__ == "__main__":
