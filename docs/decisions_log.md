@@ -51,3 +51,59 @@ is permanently bypassed in favour of the Python API.
 **Reason:** All 110 payloads reached Gemini 3.5 Flash-Lite, yet none executed the native AgentDojo injection goal; legitimate utility still succeeded in 90 cases. A zero undefended ASR creates a floor at which a defended zero cannot demonstrate security improvement, while recent work shows that fixed attacks can understate risk against newer, model-dependent targets and that attacks tuned after seeing evaluation cases invalidate held-out claims.
 
 **Impact:** Phase 7 now reports the original static null separately from a frozen calibrated baseline; Phase 8.3 and all Phase 9 API execution are blocked until Phase 6A passes. New tooling and artifacts live under `src/experiments/`, `data/attack_calibration/`, and `data/calibrated_baseline/`; all new API runners use a dashboard-aware hard quota guard with a 25-request reserve. Phase 10 remains a separate defense-aware adaptive evaluation and does not overwrite the Phase 6A attack set.
+
+### Phase 6A — Attack-set version 2 corrected mutation search
+
+**Decision:** Preserve attack-set version 1 and its 0/40 failed calibration unchanged, and implement attack-set version 2 as a separately versioned mutation-search pipeline with canonical fenced-JSON parsing, persistent accepted-candidate feedback, bounded branching, trusted-instruction goal-achievability controls, and richer task/tool/injection-position proposer context.
+
+**Reason:** Version 1 incorrectly rejected 33 syntactically valid candidates because Gemini wrapped the requested JSON in Markdown code fences, and malformed generations broke the feedback chain by returning later rounds to the raw seed instead of the last accepted candidate and target feedback. Its one-candidate linear chain and narrow strategy prompt also fell materially short of the broader TAP-inspired search described in SOP reference [15], so the 0/40 outcome diagnoses a search-quality failure rather than establishing that the target is unattackable.
+
+**Impact:** Version 1 code paths and `data/attack_calibration/mutate/` artifacts, including `generator_attempts.jsonl`, remain immutable evidence of the failed calibration; reparsing the 33 fenced responses is test evidence only and must never backfill version-1 checkpoints or results. Version 2 uses distinct identifiers and output locations, retains AgentDojo's native verdict as the sole attack-success ground truth, and must be reviewed before any new quota-consuming execution or held-out evaluation.
+
+### Phase 6A — Gemma 4 delivery-path sanity check
+
+**Decision:** Add an explicit, replay-only `gemma4-26b-a4b` diagnostic target that replays the 18 built-in-screen cases and seven accepted v1 mutation templates through the existing AgentDojo delivery and native-verdict path.
+
+**Reason:** The static and v1 calibration nulls require a harness-positive-control check against a less safety-tuned target, but this diagnostic is not a new study arm and must not generate, tune, freeze, or select attacks. Google’s current Gemini API documentation lists the hosted instruction-tuned model as `gemma-4-26b-a4b-it` and documents the same `google.genai.Client` generate-content and function-calling path already used here.
+
+**Impact:** Diagnostic results, raw traces, and checkpoints are confined to `data/diagnostics/gemma4_sanity_check/` and tagged `gemma4-26b-a4b`; the runner reads calibration artifacts only as immutable inputs, never imports or writes the Phase 6A quota ledger, and cannot be selected by the calibration or baseline CLIs. Google documents RPD limits as project-scoped but model-specific, so a future Gemma execution requires its own dashboard check and does not consume the Gemini 3.5 Flash-Lite quota-guard ledger.
+
+### Phase 6A — Gemma 4 Step 1 phase-separated trace check
+
+**Decision:** Execute the diagnostic clean-utility pre-pass and injected replay as two explicitly ordered, independently budgeted native AgentDojo calls, with an exact Google SDK request/response capture scoped only to the diagnostic output root.
+
+**Reason:** The original one-call diagnostic was terminated after the clean pre-pass consumed the shared process timeout, so it never reached the injected task. Separating AgentDojo's own clean and injected functions preserves the full clean signal while preventing it from starving the injected trace check.
+
+**Impact:** A Step 1 injected run requires a fresh successful clean marker from the same isolated diagnostic output root; `google_generate_content_events.jsonl` records the exact model, system instruction, rendered messages, tool declarations, and returned responses for operator review. No renderer, verdict logic, calibration data, quota ledger, or Phase 6/6A artifact is changed.
+
+### Phase 6A — Attack-set version 2 compact AgentDojo trace paths
+
+**Decision:** Move only attack-set version 2 AgentDojo goal-control and mutation-target raw traces to the compact `data/a2/` namespace, and explicitly reset the zero-attempt prepared journal for `goal-control-v2:builtin:direct` before the next execution.
+
+**Reason:** The original v2 goal-control path was 273 characters including its trace filename and failed on Windows before `journal.begin_api_attempt()` with `WinError 206`. The compact default layout preserves the full goal-control operation digest and puts that formerly failing trace at 220 characters; the longest deterministic v2 mutation target trace is 244 characters, leaving a 16-character MAX_PATH margin.
+
+**Impact:** Version-1 paths and the quota ledger are unchanged. The reset journal had `status=prepared`, no raw or index record, and zero provider attempts, so it contains no completed API work to preserve; v2 preflight now rejects any remaining overlong AgentDojo trace path before model execution.
+
+### Phase 6A — Attack-set version 2 goal-control logger integration
+
+**Decision:** Wrap the v2 goal-control call to `run_task_without_injection_tasks()` in the existing `OutputLogger(str(raw_root))` pattern while retaining the compact `data/a2/` trace root; leave mutation target execution unchanged because its `benchmark_suite` path already opens `OutputLogger`.
+
+**Reason:** The preserved `goal-control-v2:builtin:direct` journal failed before any Gemini request because the direct v2 call let `TraceLogger` inherit `Logger.get()`'s `NullLogger`, which has no `logdir`. This is a v2-runner integration gap, not a further path-length failure, and the diagnostic runner already used the correct explicit logger pattern.
+
+**Impact:** This supersedes the prior compact-path entry's tentative journal-reset handling: the existing failed zero-attempt journal is retained as evidence and will receive a new API-attempt entry when resumed successfully. No v1 artifact, quota-ledger data, or mutation-search methodology changes.
+
+### Phase 6A — Fail-clean AgentDojo execution and YAML renderability preflight
+
+**Decision:** Record unexpected AgentDojo execution exceptions with their type, message, and truncated traceback in the durable operation journal, stop the active stage with a distinct non-quota exit code, and reject newly generated v2 candidates whose rendered injection makes the native AgentDojo environment invalid before any target call.
+
+**Reason:** Socket/path errors, an empty-message failure, and a PyYAML scanner failure escaped the quota-only stage handlers as raw tracebacks. The YAML failure is deterministic candidate invalidity that can be detected through `TaskSuite.load_and_inject_default_environment()` without spending target quota; other unexpected benchmark failures must retain evidence and stop cleanly rather than be mistaken for quota exhaustion.
+
+**Impact:** Existing validation and native-verdict acceptance rules are unchanged. The already-failed, five-request `mutation-v2:builtin:direct:c01:workspace` journal and partial raw trace remain immutable pre-validation evidence; resume recognizes that failed non-renderable target as terminal without repeating it, while future non-renderable candidates are logged as malformed generator records and never reach target execution.
+
+### Phase 9-11 — Retarget empirical defense effectiveness to Gemma 4 26B
+
+**Decision:** Preserve Gemini 3.5 Flash-Lite as the primary robustness finding and its failed Phase 6A.11 qualification outcome, but retarget the empirical defense-effectiveness track in Phases 9-11 to `gemma-4-26b-a4b-it`, beginning with a Phase-6-equivalent static baseline that replays the exact ordered 110-row Gemini plan and all 19 retained static-corpus payload IDs represented in it.
+
+**Reason:** Attack-set version 2 completed cleanly with 0/38 native AgentDojo successes across all eight seeds, eight families, and three development domains; goal controls established task achievability, the Gemma diagnostic established harness validity, and every target attempt retained legitimate-task utility. Because this methodologically valid Gemini null cannot pass the Phase 6A.11/7.5 gate, it cannot support a measured defense reduction, whereas the isolated 25-case Gemma diagnostic produced two native successes (`direct`/Banking and `tool_knowledge`/Slack) and supplies the project's only empirical foothold for defense evaluation.
+
+**Impact:** Gemini calibration data, the original 0/110 static result, and the failed 6A.11 gate remain unchanged and separately reported. New Gemma baseline artifacts live under `data/baseline_gemma4/` and default to 110-case parity rather than automatic full-matrix expansion; later Gemma defended and defense-adaptive results must remain model-separated from Gemini. The predeclared post-baseline rule is: if Gemma reaches at least 15 successes overall and at least five per domain, skip Gemma mutation search and proceed directly to Phases 8-9 with the static Gemma rows as the undefended baseline; if it is nonzero but below either threshold, stop and report total and per-domain counts for a human top-up decision; if it is zero or near zero, report the null and do not start Gemma-specific calibration automatically.

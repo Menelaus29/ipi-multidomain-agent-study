@@ -8,7 +8,7 @@ import re
 import tempfile
 import unittest
 from collections import Counter
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -72,6 +72,114 @@ class RunBaselineTests(unittest.TestCase):
             {"workspace": 52, "banking": 46, "slack": 12},
             dict(Counter(domain for _, domain, _, _, _ in cases)),
         )
+
+    def test_gemma_default_replays_exact_committed_phase6_manifest(self) -> None:
+        payloads = run_baseline.load_corpus()
+        args = run_baseline.parse_args(["--target", "gemma4-26b", "--plan"])
+
+        cases = run_baseline.select_cases(args, payloads, run_baseline.GEMMA4_TARGET)
+
+        self.assertEqual(110, len(cases))
+        self.assertEqual(
+            {"workspace": 52, "banking": 46, "slack": 12},
+            dict(Counter(case[1] for case in cases)),
+        )
+        self.assertEqual(
+            run_baseline.PHASE6_PLAN_PATH.read_bytes(),
+            self._plan_bytes(cases),
+        )
+
+    @staticmethod
+    def _plan_bytes(cases: list[tuple[object, str, str, str, str]]) -> bytes:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "plan.tsv"
+            run_baseline.write_plan(cases, path)  # type: ignore[arg-type]
+            return path.read_bytes()
+
+    def test_full_gemma_matrix_requires_explicit_matrix_option(self) -> None:
+        default = run_baseline.parse_args(["--target", "gemma4-26b", "--plan"])
+        expanded = run_baseline.parse_args(
+            ["--target", "gemma4-26b", "--matrix", "full", "--plan"]
+        )
+
+        self.assertEqual("stratified", default.matrix)
+        self.assertEqual("full", expanded.matrix)
+        self.assertNotEqual(
+            run_baseline.target_results_path(run_baseline.GEMMA4_TARGET, "stratified", None),
+            run_baseline.target_results_path(run_baseline.GEMMA4_TARGET, "full", None),
+        )
+
+    def test_gemma_output_isolation_rejects_gemini_directories(self) -> None:
+        for path in (
+            run_baseline.GEMINI_BASELINE_ROOT / "results.jsonl",
+            run_baseline.CALIBRATED_BASELINE_ROOT / "results.jsonl",
+            run_baseline.PROJECT_ROOT / "elsewhere" / "results.jsonl",
+        ):
+            with self.subTest(path=path), self.assertRaises(
+                run_baseline.BaselinePreflightError
+            ):
+                run_baseline.validate_output_isolation(run_baseline.GEMMA4_TARGET, path)
+
+        run_baseline.validate_output_isolation(
+            run_baseline.GEMMA4_TARGET,
+            run_baseline.GEMMA4_BASELINE_ROOT / "results.jsonl",
+        )
+
+    def test_gemma_default_trace_paths_keep_real_windows_margin(self) -> None:
+        cases = run_baseline.load_committed_phase6_plan(run_baseline.load_corpus())
+        length = run_baseline.preflight_trace_paths(
+            cases,
+            target=run_baseline.GEMMA4_TARGET,
+            raw_root=run_baseline.target_raw_root(
+                run_baseline.GEMMA4_TARGET, "stratified"
+            ),
+        )
+
+        self.assertLess(
+            length + run_baseline.WINDOWS_PATH_SAFETY_MARGIN,
+            run_baseline.WINDOWS_MAX_PATH,
+        )
+
+    def test_gemma_execution_enters_model_specific_quota_guard(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        with (
+            patch.object(run_baseline, "select_cases", return_value=[case]),
+            patch.object(run_baseline, "preflight_trace_paths", return_value=200),
+            patch.object(
+                run_baseline,
+                "quota_guard_from_args",
+                return_value=nullcontext(),
+            ) as guard,
+            patch.object(run_baseline, "run_cases", return_value=0),
+        ):
+            status = run_baseline.main(
+                [
+                    "--target",
+                    "gemma4-26b",
+                    "--quota-date",
+                    "2026-08-10",
+                    "--dashboard-used",
+                    "0",
+                    "--dashboard-limit",
+                    "14400",
+                    "--max-api-requests",
+                    "1000",
+                ]
+            )
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            run_baseline.GEMMA4_TARGET.model_name,
+            guard.call_args.kwargs["quota_key"],
+        )
+        self.assertEqual(14_400, guard.call_args.kwargs["study_rpd_limit"])
 
     def test_stratified_plan_skips_unreachable_vectors_before_slicing(self) -> None:
         payload = next(payload for payload in run_baseline.load_corpus() if payload.id == "direct-03")
@@ -267,9 +375,29 @@ class RunBaselineTests(unittest.TestCase):
                     side_effect=FakeClientError("429 RESOURCE_EXHAUSTED: quota exceeded"),
                 ),
                 patch.object(run_baseline, "ClientError", FakeClientError),
+                patch.object(
+                    run_baseline,
+                    "quota_guard_from_args",
+                    return_value=nullcontext(),
+                ),
                 redirect_stderr(output),
             ):
-                status = run_baseline.main(["--max-runs", "1", "--results-path", str(Path(temporary_directory) / "results.jsonl")])
+                status = run_baseline.main(
+                    [
+                        "--max-runs",
+                        "1",
+                        "--results-path",
+                        str(Path(temporary_directory) / "results.jsonl"),
+                        "--quota-date",
+                        "2026-08-10",
+                        "--dashboard-used",
+                        "0",
+                        "--dashboard-limit",
+                        "500",
+                        "--max-api-requests",
+                        "10",
+                    ]
+                )
 
         self.assertEqual(2, status)
         self.assertIn("Stopping cleanly", output.getvalue())
