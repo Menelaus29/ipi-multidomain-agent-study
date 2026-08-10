@@ -79,7 +79,11 @@ from src.llm_providers.google_llm_factory import (
     get_google_primary_llm,
     get_google_request_attempt_count,
 )
-from src.experiments.operation_journal import agentdojo_raw_trace_path
+from src.experiments.operation_journal import (
+    UNEXPECTED_EXECUTION_EXIT_CODE,
+    agentdojo_raw_trace_path,
+    operation_exception_summary,
+)
 from src.experiments.quota_guard import add_quota_arguments, quota_guard_from_args
 from src.schemas import PayloadEntry, RunResult, SchemaValidationError
 
@@ -236,6 +240,17 @@ class BenchmarkTraceError(RuntimeError):
 
 class BaselinePreflightError(RuntimeError):
     """Raised before quota reservation when baseline inputs/paths are unsafe."""
+
+
+def _stop_after_unexpected_execution(error: Exception) -> int:
+    """Stop a checkpointed baseline run without continuing after an API-path error."""
+
+    print(
+        "Stopping baseline after an unexpected execution error: "
+        f"{operation_exception_summary(error)}",
+        file=sys.stderr,
+    )
+    return UNEXPECTED_EXECUTION_EXIT_CODE
 
 
 _UNRESOLVED_TEMPLATE = re.compile(r"\{\{[^{}]+\}\}")
@@ -1047,16 +1062,16 @@ def run_cases(
                 **execution_kwargs,
             )
         except (ClientError, RequestBudgetExceeded) as error:
-            if not is_quota_exhausted(error):
-                raise
-            print(
-                "Stopping cleanly: Google API quota/rate/request budget reached. "
-                f"{executed} completed case(s) remain checkpointed in {results_path}. "
-                f"This process started {get_google_request_attempt_count() - session_requests_before} "
-                f"{target.model_name} request attempt(s).",
-                file=sys.stderr,
-            )
-            return 2
+            if is_quota_exhausted(error):
+                print(
+                    "Stopping cleanly: Google API quota/rate/request budget reached. "
+                    f"{executed} completed case(s) remain checkpointed in {results_path}. "
+                    f"This process started {get_google_request_attempt_count() - session_requests_before} "
+                    f"{target.model_name} request attempt(s).",
+                    file=sys.stderr,
+                )
+                return 2
+            return _stop_after_unexpected_execution(error)
         except BenchmarkTraceError as error:
             print(
                 "Stopping cleanly: AgentDojo produced an errored/skipped trace; "
@@ -1064,6 +1079,8 @@ def run_cases(
                 file=sys.stderr,
             )
             return 3
+        except Exception as error:
+            return _stop_after_unexpected_execution(error)
         executed += 1
         print(
             f"Recorded {record.run_id}: payload={record.payload_id}, domain={record.domain}, "

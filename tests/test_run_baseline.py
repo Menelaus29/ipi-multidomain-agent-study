@@ -522,6 +522,50 @@ class RunBaselineTests(unittest.TestCase):
         self.assertEqual(2, status)
         self.assertIn("Stopping cleanly", output.getvalue())
 
+    def test_unexpected_case_error_stops_without_continuing(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (payload, "workspace", "email_events_injection", "user_task_14", "injection_task_0")
+        output = StringIO()
+        with (
+            patch.object(run_baseline, "completed_cases", return_value=set()),
+            patch.object(run_baseline, "execute_case", side_effect=RuntimeError("synthetic failure")),
+            redirect_stderr(output),
+        ):
+            status = run_baseline.run_cases(
+                run_baseline.parse_args(["--max-runs", "1"]),
+                [case],
+                target=run_baseline.GEMMA4_TARGET,
+                results_path=Path("results.jsonl"),
+                raw_root=Path("raw"),
+            )
+
+        self.assertEqual(run_baseline.UNEXPECTED_EXECUTION_EXIT_CODE, status)
+        self.assertIn("unexpected execution error", output.getvalue())
+
+    def test_nonquota_client_error_stops_without_continuing(self) -> None:
+        class FakeClientError(Exception):
+            pass
+
+        payload = run_baseline.load_corpus()[0]
+        case = (payload, "workspace", "email_events_injection", "user_task_14", "injection_task_0")
+        output = StringIO()
+        with (
+            patch.object(run_baseline, "ClientError", FakeClientError),
+            patch.object(run_baseline, "completed_cases", return_value=set()),
+            patch.object(run_baseline, "execute_case", side_effect=FakeClientError("500 internal error")),
+            redirect_stderr(output),
+        ):
+            status = run_baseline.run_cases(
+                run_baseline.parse_args(["--max-runs", "1"]),
+                [case],
+                target=run_baseline.GEMMA4_TARGET,
+                results_path=Path("results.jsonl"),
+                raw_root=Path("raw"),
+            )
+
+        self.assertEqual(run_baseline.UNEXPECTED_EXECUTION_EXIT_CODE, status)
+        self.assertIn("unexpected execution error", output.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
