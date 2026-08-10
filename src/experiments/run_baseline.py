@@ -1,4 +1,4 @@
-"""Run a model-separated undefended baseline with Phase 6 AgentDojo attacks.
+"""Run model-separated Phase 6 AgentDojo attacks, optionally with spotlighting.
 
 The runner deliberately calls :func:`agentdojo.scripts.benchmark.benchmark_suite`
 through Python rather than AgentDojo's CLI.  Its constructed Google AI Studio
@@ -39,6 +39,8 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
+import io
 import json
 import os
 import re
@@ -59,6 +61,12 @@ from agentdojo.scripts.benchmark import benchmark_suite
 from agentdojo.task_suite.load_suites import get_suite
 from google.genai.errors import ClientError
 
+from src.defenses.my_spotlighting import (
+    DEFENSE_NAME as MY_SPOTLIGHTING,
+    DEFENSE_VERSION as MY_SPOTLIGHTING_VERSION,
+    MySpotlightingLLM,
+    defense_source_sha256,
+)
 from src.llm_providers.google_llm_factory import (
     GEMMA4_26B_MODEL,
     GEMMA4_26B_PIPELINE_NAME,
@@ -82,11 +90,13 @@ PHASE6_PLAN_PATH = PROJECT_ROOT / "data" / "baseline" / "plan.tsv"
 GEMINI_BASELINE_ROOT = PROJECT_ROOT / "data" / "baseline"
 GEMMA4_BASELINE_ROOT = PROJECT_ROOT / "data" / "baseline_gemma4"
 CALIBRATED_BASELINE_ROOT = PROJECT_ROOT / "data" / "calibrated_baseline"
+DEFENDED_ROOT = PROJECT_ROOT / "data" / "defended"
 DEFAULT_OUTPUT = GEMINI_BASELINE_ROOT / "results.jsonl"
 RAW_ROOT = GEMINI_BASELINE_ROOT / "raw"
 BENCHMARK_VERSION = "v1.2.2"
 WINDOWS_MAX_PATH = 260
 WINDOWS_PATH_SAFETY_MARGIN = 20
+DEFENSE_MODES = ("none", MY_SPOTLIGHTING)
 
 
 @dataclass(frozen=True)
@@ -439,7 +449,10 @@ def _case_key(payload_id: str, domain: str, vector: str, user_task_id: str, inje
 
 
 def completed_cases(
-    results_path: Path, *, expected_model: str | None = None
+    results_path: Path,
+    *,
+    expected_model: str | None = None,
+    expected_defense: str | None = None,
 ) -> set[tuple[str, ...]]:
     """Read checkpoint keys from an existing results JSONL file."""
     if not results_path.exists():
@@ -457,6 +470,11 @@ def completed_cases(
             raise SchemaValidationError(
                 f"{results_path}:{line_number} has model {result.model!r}; "
                 f"expected {expected_model!r}"
+            )
+        if expected_defense is not None and result.defense != expected_defense:
+            raise SchemaValidationError(
+                f"{results_path}:{line_number} has defense {result.defense!r}; "
+                f"expected {expected_defense!r}"
             )
         vector = _vector_from_notes(result.notes)
         if vector is None:
@@ -544,6 +562,37 @@ def write_plan(
         writer.writerow(("payload_id", "domain", "channel", "injection_vector", "user_task_id", "injection_task_id"))
         for payload, domain, vector, user_task_id, injection_task_id in cases:
             writer.writerow((payload.id, domain, payload.channel, vector, user_task_id, injection_task_id))
+
+
+def case_plan_sha256(
+    cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
+) -> str:
+    """Hash the exact ordered case manifest represented by this invocation."""
+
+    handle = io.StringIO(newline="")
+    writer = csv.writer(handle, delimiter="\t")
+    writer.writerow(
+        (
+            "payload_id",
+            "domain",
+            "channel",
+            "injection_vector",
+            "user_task_id",
+            "injection_task_id",
+        )
+    )
+    for payload, domain, vector, user_task_id, injection_task_id in cases:
+        writer.writerow(
+            (
+                payload.id,
+                domain,
+                payload.channel,
+                vector,
+                user_task_id,
+                injection_task_id,
+            )
+        )
+    return hashlib.sha256(handle.getvalue().encode("utf-8")).hexdigest()
 
 
 def load_committed_phase6_plan(
@@ -641,21 +690,51 @@ def get_target_llm(target: BaselineTarget) -> Any:
 
 
 def target_results_path(
-    target: BaselineTarget, matrix: str, requested: Path | None
+    target: BaselineTarget,
+    matrix: str,
+    requested: Path | None,
+    defense: str = "none",
 ) -> Path:
     if requested is not None:
         return requested.resolve()
-    matrix_root = target.output_root if matrix == "stratified" else target.output_root / "full"
+    if defense == "none":
+        matrix_root = (
+            target.output_root
+            if matrix == "stratified"
+            else target.output_root / "full"
+        )
+    else:
+        matrix_root = defended_target_root(target)
+        if matrix == "full":
+            matrix_root /= "full"
     return (matrix_root / "results.jsonl").resolve()
 
 
-def target_raw_root(target: BaselineTarget, matrix: str) -> Path:
-    matrix_root = target.output_root if matrix == "stratified" else target.output_root / "full"
+def target_raw_root(
+    target: BaselineTarget, matrix: str, defense: str = "none"
+) -> Path:
+    if defense == "none":
+        matrix_root = (
+            target.output_root
+            if matrix == "stratified"
+            else target.output_root / "full"
+        )
+    else:
+        matrix_root = defended_target_root(target)
+        if matrix == "full":
+            matrix_root /= "full"
     # The one-letter Gemma trace component retains a 20+ character margin
     # beneath legacy Windows MAX_PATH after AgentDojo appends its full nested
     # model/suite/task/attack path. Gemini keeps its immutable Phase 6 layout.
     raw_component = "r" if target == GEMMA4_TARGET else "raw"
     return (matrix_root / raw_component).resolve()
+
+
+def defended_target_root(target: BaselineTarget) -> Path:
+    """Return a short, model-separated root that stays below Windows MAX_PATH."""
+
+    target_slug = "g4" if target == GEMMA4_TARGET else "g35"
+    return DEFENDED_ROOT / target_slug / MY_SPOTLIGHTING_VERSION
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -666,10 +745,20 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return True
 
 
-def validate_output_isolation(target: BaselineTarget, results_path: Path) -> None:
+def validate_output_isolation(
+    target: BaselineTarget,
+    results_path: Path,
+    defense: str = "none",
+) -> None:
     """Prevent Gemini, calibrated, and Gemma rows from sharing a dataset."""
 
     resolved = results_path.resolve()
+    if defense != "none":
+        if not _is_relative_to(resolved, DEFENDED_ROOT):
+            raise BaselinePreflightError(
+                f"defended output must remain below {DEFENDED_ROOT}: {resolved}"
+            )
+        return
     if target == GEMMA4_TARGET:
         if not _is_relative_to(resolved, GEMMA4_BASELINE_ROOT):
             raise BaselinePreflightError(
@@ -742,6 +831,8 @@ def execute_case(
     target: BaselineTarget = GEMINI_TARGET,
     raw_root: Path = RAW_ROOT,
     force_rerun: bool = False,
+    defense: str = "none",
+    plan_sha256: str | None = None,
 ) -> RunResult:
     """Run one AgentDojo task attempt and append its validated JSONL record."""
     suite = get_suite(BENCHMARK_VERSION, domain)
@@ -755,11 +846,16 @@ def execute_case(
     # factory is used anywhere in either recorded baseline path.
     requests_before = get_google_request_attempt_count()
     started_at = time.monotonic()
+    target_llm = get_target_llm(target)
+    if defense == MY_SPOTLIGHTING:
+        target_llm = MySpotlightingLLM(target_llm)
+    elif defense != "none":
+        raise BaselinePreflightError(f"unsupported defense mode: {defense!r}")
     results = benchmark_suite(
         suite=suite,
         # AgentDojo's runtime accepts a constructed BasePipelineElement here,
         # although its installed annotation is still limited to ModelsEnum.
-        model=cast(ModelsEnum, get_target_llm(target)),
+        model=cast(ModelsEnum, target_llm),
         logdir=logdir,
         force_rerun=force_rerun,
         benchmark_version=BENCHMARK_VERSION,
@@ -774,6 +870,21 @@ def execute_case(
     relative_raw_path = raw_path.relative_to(PROJECT_ROOT).as_posix()
     api_request_attempts = get_google_request_attempt_count() - requests_before
     elapsed_seconds = time.monotonic() - started_at
+    is_defended = defense == MY_SPOTLIGHTING
+    if is_defended and plan_sha256 is None:
+        raise BaselinePreflightError(
+            "my_spotlighting execution requires the ordered plan SHA-256"
+        )
+    rendered_attack = (
+        render_payload(payload, suite.injection_tasks[injection_task_id].GOAL)
+        if is_defended
+        else None
+    )
+    attack_sha256 = (
+        hashlib.sha256(rendered_attack.encode("utf-8")).hexdigest()
+        if rendered_attack is not None
+        else None
+    )
     record = RunResult(
         run_id=str(uuid.uuid4()),
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -783,7 +894,7 @@ def execute_case(
         payload_id=payload.id,
         channel=payload.channel,
         model=f"google-{target.model_name}",
-        defense="none",
+        defense=defense,
         # Despite its historical ``security`` name, AgentDojo returns True
         # exactly when the injection task was executed successfully.
         attack_success=attack_succeeded(security),
@@ -793,6 +904,17 @@ def execute_case(
             f"api_request_attempts={api_request_attempts}; elapsed_seconds={elapsed_seconds:.3f}; "
             "attack_success equals AgentDojo's injection-task success check"
         ),
+        utility_success=(
+            results["utility_results"][(user_task_id, injection_task_id)]
+            if is_defended
+            else None
+        ),
+        split="holdout" if is_defended else None,
+        attack_set_version="static-corpus-v1" if is_defended else None,
+        attack_sha256=attack_sha256,
+        plan_sha256=plan_sha256 if is_defended else None,
+        defense_version=MY_SPOTLIGHTING_VERSION if is_defended else None,
+        defense_sha256=defense_source_sha256() if is_defended else None,
     )
     RunResult.from_dict(record.__dict__, path="generated RunResult")
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -808,6 +930,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=tuple(BASELINE_TARGETS),
         default=GEMINI_TARGET.cli_name,
         help="explicit model-separated target; defaults to the original Gemini baseline",
+    )
+    parser.add_argument(
+        "--defense",
+        choices=DEFENSE_MODES,
+        default="none",
+        help="select the additive custom defense; defaults to the unchanged undefended path",
     )
     parser.add_argument("--plan", action="store_true", help="Print planned cases without invoking the API")
     parser.add_argument("--plan-output", type=Path, help="Optional TSV path for a no-API plan manifest")
@@ -883,9 +1011,13 @@ def run_cases(
     if args.prune_errored_results:
         removed = prune_errored_results(results_path)
         print(f"Pruned {removed} errored/skipped checkpoint row(s) from {results_path}")
-    completed = completed_cases(
-        results_path, expected_model=f"google-{target.model_name}"
-    )
+    completed_kwargs: dict[str, str] = {
+        "expected_model": f"google-{target.model_name}"
+    }
+    if args.defense != "none":
+        completed_kwargs["expected_defense"] = args.defense
+    completed = completed_cases(results_path, **completed_kwargs)
+    plan_sha256 = case_plan_sha256(cases) if args.defense != "none" else None
     executed = 0
     session_requests_before = get_google_request_attempt_count()
     for payload, domain, vector, user_task_id, injection_task_id in cases:
@@ -896,6 +1028,12 @@ def run_cases(
         if args.max_runs is not None and executed >= args.max_runs:
             break
         try:
+            execution_kwargs: dict[str, Any] = {}
+            if args.defense != "none":
+                execution_kwargs = {
+                    "defense": args.defense,
+                    "plan_sha256": plan_sha256,
+                }
             record = execute_case(
                 payload,
                 domain,
@@ -906,6 +1044,7 @@ def run_cases(
                 target=target,
                 raw_root=raw_root,
                 force_rerun=args.force_rerun,
+                **execution_kwargs,
             )
         except (ClientError, RequestBudgetExceeded) as error:
             if not is_quota_exhausted(error):
@@ -951,9 +1090,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"{payload.id}\t{domain}\t{payload.channel}\t{vector}\t{user_task_id}\t{injection_task_id}")
         return 0
 
-    results_path = target_results_path(target, args.matrix, args.results_path)
-    raw_root = target_raw_root(target, args.matrix)
-    validate_output_isolation(target, results_path)
+    results_path = target_results_path(
+        target, args.matrix, args.results_path, args.defense
+    )
+    raw_root = target_raw_root(target, args.matrix, args.defense)
+    validate_output_isolation(target, results_path, args.defense)
     longest_path = preflight_trace_paths(cases, target=target, raw_root=raw_root)
     print(
         f"Baseline preflight: target={target.model_name}, cases={len(cases)}, "

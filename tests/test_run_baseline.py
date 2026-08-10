@@ -13,6 +13,8 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
+
 from src.experiments import run_baseline
 from src.experiments import run_positive_control
 from src.schemas import RunResult
@@ -33,6 +35,13 @@ class _FakeSuite:
 
     def get_injection_vector_defaults(self) -> dict[str, str]:
         return self._vectors
+
+
+class _FakeLLM(BasePipelineElement):
+    name = "fake-target"
+
+    def query(self, query, runtime, env=None, messages=(), extra_args={}):
+        return query, runtime, env, messages, extra_args
 
 
 class RunBaselineTests(unittest.TestCase):
@@ -108,6 +117,42 @@ class RunBaselineTests(unittest.TestCase):
             run_baseline.target_results_path(run_baseline.GEMMA4_TARGET, "stratified", None),
             run_baseline.target_results_path(run_baseline.GEMMA4_TARGET, "full", None),
         )
+
+    def test_custom_defense_is_selectable_and_defaults_remain_undefended(self) -> None:
+        self.assertEqual("none", run_baseline.parse_args(["--plan"]).defense)
+        self.assertEqual(
+            run_baseline.MY_SPOTLIGHTING,
+            run_baseline.parse_args(
+                ["--plan", "--defense", run_baseline.MY_SPOTLIGHTING]
+            ).defense,
+        )
+
+    def test_custom_defense_uses_isolated_model_specific_paths(self) -> None:
+        gemini = run_baseline.target_results_path(
+            run_baseline.GEMINI_TARGET,
+            "stratified",
+            None,
+            run_baseline.MY_SPOTLIGHTING,
+        )
+        gemma = run_baseline.target_results_path(
+            run_baseline.GEMMA4_TARGET,
+            "stratified",
+            None,
+            run_baseline.MY_SPOTLIGHTING,
+        )
+
+        self.assertNotEqual(gemini, gemma)
+        self.assertTrue(run_baseline._is_relative_to(gemini, run_baseline.DEFENDED_ROOT))
+        self.assertTrue(run_baseline._is_relative_to(gemma, run_baseline.DEFENDED_ROOT))
+        run_baseline.validate_output_isolation(
+            run_baseline.GEMMA4_TARGET, gemma, run_baseline.MY_SPOTLIGHTING
+        )
+        with self.assertRaises(run_baseline.BaselinePreflightError):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                run_baseline.GEMMA4_BASELINE_ROOT / "results.jsonl",
+                run_baseline.MY_SPOTLIGHTING,
+            )
 
     def test_gemma_output_isolation_rejects_gemini_directories(self) -> None:
         for path in (
@@ -295,6 +340,81 @@ class RunBaselineTests(unittest.TestCase):
             {("direct-01", "workspace", "email_events_injection", "user_task_14", "injection_task_0")},
             completed,
         )
+
+    def test_completed_cases_rejects_a_mixed_defense_checkpoint(self) -> None:
+        record = RunResult(
+            run_id="run-1",
+            timestamp="2026-08-04T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_0",
+            payload_id="direct-01",
+            channel="email_body",
+            model="google-gemini-3.5-flash-lite",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "results.jsonl"
+            path.write_text(json.dumps(record.__dict__) + "\n", encoding="utf-8")
+            with self.assertRaises(run_baseline.SchemaValidationError):
+                run_baseline.completed_cases(
+                    path, expected_defense=run_baseline.MY_SPOTLIGHTING
+                )
+
+    def test_execute_case_wires_custom_adapter_and_provenance_without_network(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        suite = _FakeSuite("workspace")
+        suite.injection_tasks["injection_task_0"] = type(
+            "InjectionTask", (), {"GOAL": self.NATIVE_GOAL}
+        )()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "trace.json"
+            raw_path.write_text(
+                json.dumps({"error": None, "messages": []}), encoding="utf-8"
+            )
+            results_path = root / "results.jsonl"
+            with (
+                patch.object(run_baseline, "get_suite", return_value=suite),
+                patch.object(run_baseline, "get_target_llm", return_value=_FakeLLM()),
+                patch.object(run_baseline, "_raw_trace_path", return_value=raw_path),
+                patch.object(run_baseline, "PROJECT_ROOT", root),
+                patch.object(
+                    run_baseline,
+                    "benchmark_suite",
+                    return_value={
+                        "security_results": {
+                            ("user_task_14", "injection_task_0"): False
+                        },
+                        "utility_results": {
+                            ("user_task_14", "injection_task_0"): True
+                        },
+                    },
+                ) as benchmark,
+            ):
+                record = run_baseline.execute_case(
+                    payload,
+                    "workspace",
+                    "email_events_injection",
+                    "user_task_14",
+                    "injection_task_0",
+                    results_path,
+                    raw_root=root,
+                    defense=run_baseline.MY_SPOTLIGHTING,
+                    plan_sha256="a" * 64,
+                )
+
+        self.assertIsInstance(
+            benchmark.call_args.kwargs["model"], run_baseline.MySpotlightingLLM
+        )
+        self.assertEqual(run_baseline.MY_SPOTLIGHTING, record.defense)
+        self.assertEqual(run_baseline.MY_SPOTLIGHTING_VERSION, record.defense_version)
+        self.assertEqual("static-corpus-v1", record.attack_set_version)
+        self.assertEqual("holdout", record.split)
+        self.assertTrue(record.utility_success)
 
     def test_quota_detection_requires_a_google_429(self) -> None:
         self.assertTrue(run_baseline.is_quota_exhausted(Exception("429 RESOURCE_EXHAUSTED: quota exceeded")))
