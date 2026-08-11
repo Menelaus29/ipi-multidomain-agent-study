@@ -22,16 +22,17 @@ from agentdojo.scripts.benchmark import benchmark_suite
 from agentdojo.task_suite.load_suites import get_suite
 from google.genai.errors import ClientError
 
+from src.experiments.operation_journal import agentdojo_raw_trace_path
 from src.experiments.run_baseline import (
     BENCHMARK_VERSION,
     PROJECT_ROOT,
     RAW_ROOT,
-    _raw_trace_path,
     attack_succeeded,
     is_quota_exhausted,
 )
 from src.llm_providers.google_llm_factory import (
     PRIMARY_MODEL,
+    PRIMARY_PIPELINE_NAME,
     get_google_primary_llm,
     get_google_request_attempt_count,
 )
@@ -82,7 +83,14 @@ def execute_control(domain: str, results_path: Path) -> RunResult:
         attack=ATTACK_NAME,
     )
     verdict = results["security_results"][(user_task_id, injection_task_id)]
-    raw_path = _raw_trace_path(logdir, user_task_id, ATTACK_NAME, injection_task_id)
+    raw_path = agentdojo_raw_trace_path(
+        logdir,
+        pipeline_name=PRIMARY_PIPELINE_NAME,
+        suite_name=domain,
+        user_task_id=user_task_id,
+        attack_name=ATTACK_NAME,
+        injection_task_id=injection_task_id,
+    )
     raw_trace = json.loads(raw_path.read_text(encoding="utf-8"))
     record = RunResult(
         run_id=str(uuid.uuid4()),

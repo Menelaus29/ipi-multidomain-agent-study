@@ -8,10 +8,12 @@ import re
 import tempfile
 import unittest
 from collections import Counter
-from contextlib import redirect_stderr
+from contextlib import nullcontext, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
+
+from agentdojo.agent_pipeline.base_pipeline_element import BasePipelineElement
 
 from src.experiments import run_baseline
 from src.experiments import run_positive_control
@@ -33,6 +35,13 @@ class _FakeSuite:
 
     def get_injection_vector_defaults(self) -> dict[str, str]:
         return self._vectors
+
+
+class _FakeLLM(BasePipelineElement):
+    name = "fake-target"
+
+    def query(self, query, runtime, env=None, messages=(), extra_args={}):
+        return query, runtime, env, messages, extra_args
 
 
 class RunBaselineTests(unittest.TestCase):
@@ -72,6 +81,150 @@ class RunBaselineTests(unittest.TestCase):
             {"workspace": 52, "banking": 46, "slack": 12},
             dict(Counter(domain for _, domain, _, _, _ in cases)),
         )
+
+    def test_gemma_default_replays_exact_committed_phase6_manifest(self) -> None:
+        payloads = run_baseline.load_corpus()
+        args = run_baseline.parse_args(["--target", "gemma4-26b", "--plan"])
+
+        cases = run_baseline.select_cases(args, payloads, run_baseline.GEMMA4_TARGET)
+
+        self.assertEqual(110, len(cases))
+        self.assertEqual(
+            {"workspace": 52, "banking": 46, "slack": 12},
+            dict(Counter(case[1] for case in cases)),
+        )
+        self.assertEqual(
+            run_baseline.PHASE6_PLAN_PATH.read_bytes(),
+            self._plan_bytes(cases),
+        )
+
+    @staticmethod
+    def _plan_bytes(cases: list[tuple[object, str, str, str, str]]) -> bytes:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "plan.tsv"
+            run_baseline.write_plan(cases, path)  # type: ignore[arg-type]
+            return path.read_bytes()
+
+    def test_full_gemma_matrix_requires_explicit_matrix_option(self) -> None:
+        default = run_baseline.parse_args(["--target", "gemma4-26b", "--plan"])
+        expanded = run_baseline.parse_args(
+            ["--target", "gemma4-26b", "--matrix", "full", "--plan"]
+        )
+
+        self.assertEqual("stratified", default.matrix)
+        self.assertEqual("full", expanded.matrix)
+        self.assertNotEqual(
+            run_baseline.target_results_path(run_baseline.GEMMA4_TARGET, "stratified", None),
+            run_baseline.target_results_path(run_baseline.GEMMA4_TARGET, "full", None),
+        )
+
+    def test_custom_defense_is_selectable_and_defaults_remain_undefended(self) -> None:
+        self.assertEqual("none", run_baseline.parse_args(["--plan"]).defense)
+        self.assertEqual(
+            run_baseline.MY_SPOTLIGHTING,
+            run_baseline.parse_args(
+                ["--plan", "--defense", run_baseline.MY_SPOTLIGHTING]
+            ).defense,
+        )
+
+    def test_custom_defense_uses_isolated_model_specific_paths(self) -> None:
+        gemini = run_baseline.target_results_path(
+            run_baseline.GEMINI_TARGET,
+            "stratified",
+            None,
+            run_baseline.MY_SPOTLIGHTING,
+        )
+        gemma = run_baseline.target_results_path(
+            run_baseline.GEMMA4_TARGET,
+            "stratified",
+            None,
+            run_baseline.MY_SPOTLIGHTING,
+        )
+
+        self.assertNotEqual(gemini, gemma)
+        self.assertTrue(run_baseline._is_relative_to(gemini, run_baseline.DEFENDED_ROOT))
+        self.assertTrue(run_baseline._is_relative_to(gemma, run_baseline.DEFENDED_ROOT))
+        run_baseline.validate_output_isolation(
+            run_baseline.GEMMA4_TARGET, gemma, run_baseline.MY_SPOTLIGHTING
+        )
+        with self.assertRaises(run_baseline.BaselinePreflightError):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                run_baseline.GEMMA4_BASELINE_ROOT / "results.jsonl",
+                run_baseline.MY_SPOTLIGHTING,
+            )
+
+    def test_gemma_output_isolation_rejects_gemini_directories(self) -> None:
+        for path in (
+            run_baseline.GEMINI_BASELINE_ROOT / "results.jsonl",
+            run_baseline.CALIBRATED_BASELINE_ROOT / "results.jsonl",
+            run_baseline.PROJECT_ROOT / "elsewhere" / "results.jsonl",
+        ):
+            with self.subTest(path=path), self.assertRaises(
+                run_baseline.BaselinePreflightError
+            ):
+                run_baseline.validate_output_isolation(run_baseline.GEMMA4_TARGET, path)
+
+        run_baseline.validate_output_isolation(
+            run_baseline.GEMMA4_TARGET,
+            run_baseline.GEMMA4_BASELINE_ROOT / "results.jsonl",
+        )
+
+    def test_gemma_default_trace_paths_keep_real_windows_margin(self) -> None:
+        cases = run_baseline.load_committed_phase6_plan(run_baseline.load_corpus())
+        length = run_baseline.preflight_trace_paths(
+            cases,
+            target=run_baseline.GEMMA4_TARGET,
+            raw_root=run_baseline.target_raw_root(
+                run_baseline.GEMMA4_TARGET, "stratified"
+            ),
+        )
+
+        self.assertLess(
+            length + run_baseline.WINDOWS_PATH_SAFETY_MARGIN,
+            run_baseline.WINDOWS_MAX_PATH,
+        )
+
+    def test_gemma_execution_enters_model_specific_quota_guard(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        with (
+            patch.object(run_baseline, "select_cases", return_value=[case]),
+            patch.object(run_baseline, "preflight_trace_paths", return_value=200),
+            patch.object(
+                run_baseline,
+                "quota_guard_from_args",
+                return_value=nullcontext(),
+            ) as guard,
+            patch.object(run_baseline, "run_cases", return_value=0),
+        ):
+            status = run_baseline.main(
+                [
+                    "--target",
+                    "gemma4-26b",
+                    "--quota-date",
+                    "2026-08-10",
+                    "--dashboard-used",
+                    "0",
+                    "--dashboard-limit",
+                    "14400",
+                    "--max-api-requests",
+                    "1000",
+                ]
+            )
+
+        self.assertEqual(0, status)
+        self.assertEqual(
+            run_baseline.GEMMA4_TARGET.model_name,
+            guard.call_args.kwargs["quota_key"],
+        )
+        self.assertEqual(14_400, guard.call_args.kwargs["study_rpd_limit"])
 
     def test_stratified_plan_skips_unreachable_vectors_before_slicing(self) -> None:
         payload = next(payload for payload in run_baseline.load_corpus() if payload.id == "direct-03")
@@ -163,6 +316,66 @@ class RunBaselineTests(unittest.TestCase):
             lines[1],
         )
 
+    def test_expected_plan_hash_accepts_the_exact_ordered_plan(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        cases = [
+            (
+                payload,
+                "workspace",
+                "email_events_injection",
+                "user_task_14",
+                "injection_task_0",
+            )
+        ]
+        expected = run_baseline.case_plan_sha256(cases)
+
+        self.assertEqual(
+            expected,
+            run_baseline.verify_expected_plan_sha256(cases, expected),
+        )
+
+    def test_expected_plan_hash_rejects_malformed_or_changed_plan(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        cases = [
+            (
+                payload,
+                "workspace",
+                "email_events_injection",
+                "user_task_14",
+                "injection_task_0",
+            )
+        ]
+
+        with self.assertRaisesRegex(
+            run_baseline.BaselinePreflightError, "lowercase 64-character"
+        ):
+            run_baseline.verify_expected_plan_sha256(cases, "not-a-digest")
+        with self.assertRaisesRegex(
+            run_baseline.BaselinePreflightError, "selected case plan does not match"
+        ):
+            run_baseline.verify_expected_plan_sha256(cases, "0" * 64)
+
+    def test_changed_plan_is_rejected_before_quota_reservation(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        with (
+            patch.object(run_baseline, "select_cases", return_value=[case]),
+            patch.object(run_baseline, "quota_guard_from_args") as quota_guard,
+            self.assertRaisesRegex(
+                run_baseline.BaselinePreflightError,
+                "selected case plan does not match",
+            ),
+        ):
+            run_baseline.main(["--expected-plan-sha256", "0" * 64])
+
+        quota_guard.assert_not_called()
+
     def test_completed_cases_reads_a_valid_checkpoint(self) -> None:
         record = RunResult(
             run_id="run-1",
@@ -188,6 +401,81 @@ class RunBaselineTests(unittest.TestCase):
             completed,
         )
 
+    def test_completed_cases_rejects_a_mixed_defense_checkpoint(self) -> None:
+        record = RunResult(
+            run_id="run-1",
+            timestamp="2026-08-04T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_0",
+            payload_id="direct-01",
+            channel="email_body",
+            model="google-gemini-3.5-flash-lite",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "results.jsonl"
+            path.write_text(json.dumps(record.__dict__) + "\n", encoding="utf-8")
+            with self.assertRaises(run_baseline.SchemaValidationError):
+                run_baseline.completed_cases(
+                    path, expected_defense=run_baseline.MY_SPOTLIGHTING
+                )
+
+    def test_execute_case_wires_custom_adapter_and_provenance_without_network(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        suite = _FakeSuite("workspace")
+        suite.injection_tasks["injection_task_0"] = type(
+            "InjectionTask", (), {"GOAL": self.NATIVE_GOAL}
+        )()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "trace.json"
+            raw_path.write_text(
+                json.dumps({"error": None, "messages": []}), encoding="utf-8"
+            )
+            results_path = root / "results.jsonl"
+            with (
+                patch.object(run_baseline, "get_suite", return_value=suite),
+                patch.object(run_baseline, "get_target_llm", return_value=_FakeLLM()),
+                patch.object(run_baseline, "_raw_trace_path", return_value=raw_path),
+                patch.object(run_baseline, "PROJECT_ROOT", root),
+                patch.object(
+                    run_baseline,
+                    "benchmark_suite",
+                    return_value={
+                        "security_results": {
+                            ("user_task_14", "injection_task_0"): False
+                        },
+                        "utility_results": {
+                            ("user_task_14", "injection_task_0"): True
+                        },
+                    },
+                ) as benchmark,
+            ):
+                record = run_baseline.execute_case(
+                    payload,
+                    "workspace",
+                    "email_events_injection",
+                    "user_task_14",
+                    "injection_task_0",
+                    results_path,
+                    raw_root=root,
+                    defense=run_baseline.MY_SPOTLIGHTING,
+                    plan_sha256="a" * 64,
+                )
+
+        self.assertIsInstance(
+            benchmark.call_args.kwargs["model"], run_baseline.MySpotlightingLLM
+        )
+        self.assertEqual(run_baseline.MY_SPOTLIGHTING, record.defense)
+        self.assertEqual(run_baseline.MY_SPOTLIGHTING_VERSION, record.defense_version)
+        self.assertEqual("static-corpus-v1", record.attack_set_version)
+        self.assertEqual("holdout", record.split)
+        self.assertTrue(record.utility_success)
+
     def test_quota_detection_requires_a_google_429(self) -> None:
         self.assertTrue(run_baseline.is_quota_exhausted(Exception("429 RESOURCE_EXHAUSTED: quota exceeded")))
         self.assertTrue(
@@ -203,6 +491,140 @@ class RunBaselineTests(unittest.TestCase):
                 {"error": "503 UNAVAILABLE", "messages": []},
                 Path("errored.json"),
             )
+
+    def test_retryable_trace_detection_accepts_only_http_5xx(self) -> None:
+        self.assertTrue(
+            run_baseline.is_retryable_agentdojo_trace_error(
+                run_baseline.BenchmarkTraceError(Path("errored.json"), "500 INTERNAL")
+            )
+        )
+        self.assertFalse(
+            run_baseline.is_retryable_agentdojo_trace_error(
+                run_baseline.BenchmarkTraceError(
+                    Path("errored.json"), "400 INVALID_ARGUMENT"
+                )
+            )
+        )
+
+    def test_retryable_trace_is_archived_retried_and_cleared_after_success(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        record = RunResult(
+            run_id="retry-success",
+            timestamp="2026-08-10T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_0",
+            payload_id=payload.id,
+            channel=payload.channel,
+            model="google-gemma-4-26b-a4b-it",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "errored.json"
+            raw_path.write_text(
+                json.dumps({"error": "500 INTERNAL", "messages": []}),
+                encoding="utf-8",
+            )
+            results_path = root / "results.jsonl"
+            with (
+                patch.object(run_baseline, "completed_cases", return_value=set()),
+                patch.object(
+                    run_baseline,
+                    "execute_case",
+                    side_effect=[
+                        run_baseline.BenchmarkTraceError(raw_path, "500 INTERNAL"),
+                        record,
+                    ],
+                ) as execute,
+            ):
+                status = run_baseline.run_cases(
+                    run_baseline.parse_args(["--max-case-retries", "1"]),
+                    [case],
+                    target=run_baseline.GEMMA4_TARGET,
+                    results_path=results_path,
+                    raw_root=root / "raw",
+                )
+
+            self.assertEqual(0, status)
+            self.assertEqual([False, True], [call.kwargs["force_rerun"] for call in execute.call_args_list])
+            archive = next((root / "retryable_traces").rglob("attempt-1.json"))
+            self.assertEqual("500 INTERNAL", json.loads(archive.read_text())["error"])
+            self.assertEqual({}, json.loads(run_baseline.retry_queue_path(results_path).read_text()))
+
+    def test_retryable_trace_exhaustion_defers_case_without_a_result(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        failed_case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        later_case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_1",
+        )
+        later_record = RunResult(
+            run_id="later-case",
+            timestamp="2026-08-10T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_1",
+            payload_id=payload.id,
+            channel=payload.channel,
+            model="google-gemma-4-26b-a4b-it",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "errored.json"
+            raw_path.write_text(
+                json.dumps({"error": "503 UNAVAILABLE", "messages": []}),
+                encoding="utf-8",
+            )
+            results_path = root / "results.jsonl"
+            error = run_baseline.BenchmarkTraceError(raw_path, "503 UNAVAILABLE")
+            with (
+                patch.object(run_baseline, "completed_cases", return_value=set()),
+                patch.object(
+                    run_baseline,
+                    "execute_case",
+                    side_effect=[error, error, later_record],
+                ) as execute,
+            ):
+                status = run_baseline.run_cases(
+                    run_baseline.parse_args(["--max-case-retries", "1"]),
+                    [failed_case, later_case],
+                    target=run_baseline.GEMMA4_TARGET,
+                    results_path=results_path,
+                    raw_root=root / "raw",
+                )
+
+            self.assertEqual(run_baseline.RETRYABLE_CASES_PENDING_EXIT_CODE, status)
+            queue = json.loads(run_baseline.retry_queue_path(results_path).read_text())
+            self.assertEqual(1, len(queue))
+            queued = next(iter(queue.values()))
+            self.assertEqual("pending", queued["status"])
+            self.assertEqual(2, queued["failure_count"])
+            self.assertEqual("injection_task_1", execute.call_args_list[-1].args[4])
+            self.assertFalse(results_path.exists())
 
     def test_prune_errored_results_keeps_only_completed_traces(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -267,12 +689,76 @@ class RunBaselineTests(unittest.TestCase):
                     side_effect=FakeClientError("429 RESOURCE_EXHAUSTED: quota exceeded"),
                 ),
                 patch.object(run_baseline, "ClientError", FakeClientError),
+                patch.object(
+                    run_baseline,
+                    "quota_guard_from_args",
+                    return_value=nullcontext(),
+                ),
                 redirect_stderr(output),
             ):
-                status = run_baseline.main(["--max-runs", "1", "--results-path", str(Path(temporary_directory) / "results.jsonl")])
+                status = run_baseline.main(
+                    [
+                        "--max-runs",
+                        "1",
+                        "--results-path",
+                        str(Path(temporary_directory) / "results.jsonl"),
+                        "--quota-date",
+                        "2026-08-10",
+                        "--dashboard-used",
+                        "0",
+                        "--dashboard-limit",
+                        "500",
+                        "--max-api-requests",
+                        "10",
+                    ]
+                )
 
         self.assertEqual(2, status)
         self.assertIn("Stopping cleanly", output.getvalue())
+
+    def test_unexpected_case_error_stops_without_continuing(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (payload, "workspace", "email_events_injection", "user_task_14", "injection_task_0")
+        output = StringIO()
+        with (
+            patch.object(run_baseline, "completed_cases", return_value=set()),
+            patch.object(run_baseline, "execute_case", side_effect=RuntimeError("synthetic failure")),
+            redirect_stderr(output),
+        ):
+            status = run_baseline.run_cases(
+                run_baseline.parse_args(["--max-runs", "1"]),
+                [case],
+                target=run_baseline.GEMMA4_TARGET,
+                results_path=Path("results.jsonl"),
+                raw_root=Path("raw"),
+            )
+
+        self.assertEqual(run_baseline.UNEXPECTED_EXECUTION_EXIT_CODE, status)
+        self.assertIn("unexpected execution error", output.getvalue())
+
+    def test_nonquota_client_error_stops_without_continuing(self) -> None:
+        class FakeClientError(Exception):
+            pass
+
+        payload = run_baseline.load_corpus()[0]
+        case = (payload, "workspace", "email_events_injection", "user_task_14", "injection_task_0")
+        output = StringIO()
+        with (
+            patch.object(run_baseline, "ClientError", FakeClientError),
+            patch.object(run_baseline, "completed_cases", return_value=set()),
+            patch.object(run_baseline, "execute_case", side_effect=FakeClientError("500 internal error")),
+            redirect_stderr(output),
+        ):
+            status = run_baseline.run_cases(
+                run_baseline.parse_args(["--max-runs", "1"]),
+                [case],
+                target=run_baseline.GEMMA4_TARGET,
+                results_path=Path("results.jsonl"),
+                raw_root=Path("raw"),
+            )
+
+        self.assertEqual(run_baseline.UNEXPECTED_EXECUTION_EXIT_CODE, status)
+        self.assertIn("unexpected execution error", output.getvalue())
 
 
 if __name__ == "__main__":
