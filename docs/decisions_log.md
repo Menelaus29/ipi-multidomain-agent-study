@@ -107,3 +107,19 @@ is permanently bypassed in favour of the Python API.
 **Reason:** Attack-set version 2 completed cleanly with 0/38 native AgentDojo successes across all eight seeds, eight families, and three development domains; goal controls established task achievability, the Gemma diagnostic established harness validity, and every target attempt retained legitimate-task utility. Because this methodologically valid Gemini null cannot pass the Phase 6A.11/7.5 gate, it cannot support a measured defense reduction, whereas the isolated 25-case Gemma diagnostic produced two native successes (`direct`/Banking and `tool_knowledge`/Slack) and supplies the project's only empirical foothold for defense evaluation.
 
 **Impact:** Gemini calibration data, the original 0/110 static result, and the failed 6A.11 gate remain unchanged and separately reported. New Gemma baseline artifacts live under `data/baseline_gemma4/` and default to 110-case parity rather than automatic full-matrix expansion; later Gemma defended and defense-adaptive results must remain model-separated from Gemini. The predeclared post-baseline rule is: if Gemma reaches at least 15 successes overall and at least five per domain, skip Gemma mutation search and proceed directly to Phases 8-9 with the static Gemma rows as the undefended baseline; if it is nonzero but below either threshold, stop and report total and per-domain counts for a human top-up decision; if it is zero or near zero, report the null and do not start Gemma-specific calibration automatically.
+
+### Phase 9-11 — Banking selected-payload replication and transfer follow-up
+
+**Decision:** After the completed Gemma parity baseline produced five native successes, all in Banking, add one fixed `gemma4-banking-followup-v1` study that evaluates the five successful payloads on a frozen 180-row Banking full-file-surface plan, analyzes its 20 repeated and 160 fresh cases separately, and permits a matched frozen-defense run only if the fresh partition contains at least five successes.
+
+**Reason:** The original result did not pass the cross-domain gate, while an exhaustive Banking expansion or a new Gemma calibration pipeline would exceed the remaining schedule without directly testing whether the observed five-payload signal transfers. The existing filtered full-matrix path provides the required surface and goal diversity without a new live execution subsystem, provided selection bias, repeated cases, hashes, and stopping rules are declared before calls.
+
+**Impact:** The original 110-row Gemma baseline remains immutable and is never pooled with this follow-up; `data/baseline_gemma4/banking_followup/plan.tsv` and its metadata freeze the follow-up, any later defense claim is Banking- and selected-payload-specific, and fewer than five fresh successes terminates live experimentation before a defended run.
+
+### Phase 9-11 — Gemma defended output namespace
+
+**Decision:** Keep Gemma undefended baseline and follow-up artifacts under `data/baseline_gemma4/`, while storing Gemma defended validation and full-run artifacts under the existing model-qualified `data/defended/g4/v1/` namespace rather than the generic `data/defended/` paths in the original Phase 9 text.
+
+**Reason:** The shared runner already separates defended outputs by model and defense version, and the short `g4/v1` namespace preserves the tested Windows trace-path margin. This is a storage/provenance clarification only: defended Gemma rows remain separate from Gemini, calibrated-baseline, and original discovery datasets.
+
+**Impact:** Phase 9 uses `data/defended/g4/v1/{builtin_dev,custom_dev,full}/`; every defended row must retain the Gemma model, follow-up plan, payload, and defense hashes, with the 20 repetition and 160 fresh partitions reported separately.
