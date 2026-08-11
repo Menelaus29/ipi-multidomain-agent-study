@@ -26,6 +26,7 @@ from src.llm_providers.google_llm_factory import (
     TokenWindowPacer,
     approximate_request_tokens,
     classify_quota_error,
+    is_retryable_server_error,
 )
 
 
@@ -188,6 +189,34 @@ class GoogleLLMFactoryTests(unittest.TestCase):
 
         self.assertEqual(1, client.models.calls)
         self.assertEqual([], fake_time.sleeps)
+
+    def test_http_500_client_error_is_retried_before_reaching_agentdojo(self) -> None:
+        fake_time = _FakeTime()
+        limiter = RequestRateLimiter(
+            0.0,
+            clock=fake_time.monotonic,
+            sleeper=fake_time.sleep,
+        )
+        internal_error = ClientError(
+            500, {"error": {"status": "INTERNAL", "message": "Internal error"}}
+        )
+        expected = object()
+        client = _FakeClient([internal_error, expected])
+        llm = Gemini3LLM("test-model", client, rate_limiter=limiter)  # type: ignore[arg-type]
+
+        actual = llm._generate_content([], genai_types.GenerateContentConfig())
+
+        self.assertIs(expected, actual)
+        self.assertEqual(2, client.models.calls)
+        self.assertEqual([4.5], fake_time.sleeps)
+        self.assertTrue(is_retryable_server_error(internal_error))
+
+    def test_client_errors_outside_the_5xx_range_are_not_transient(self) -> None:
+        self.assertFalse(
+            is_retryable_server_error(
+                ClientError(400, {"error": {"status": "INVALID_ARGUMENT"}})
+            )
+        )
 
     def test_tpm_error_waits_and_retries_with_the_rpm_bound(self) -> None:
         fake_time = _FakeTime()

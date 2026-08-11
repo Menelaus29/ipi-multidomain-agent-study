@@ -82,6 +82,8 @@ from src.llm_providers.google_llm_factory import (
 from src.experiments.operation_journal import (
     UNEXPECTED_EXECUTION_EXIT_CODE,
     agentdojo_raw_trace_path,
+    atomic_write_bytes,
+    atomic_write_json,
     operation_exception_summary,
 )
 from src.experiments.quota_guard import add_quota_arguments, quota_guard_from_args
@@ -101,6 +103,9 @@ BENCHMARK_VERSION = "v1.2.2"
 WINDOWS_MAX_PATH = 260
 WINDOWS_PATH_SAFETY_MARGIN = 20
 DEFENSE_MODES = ("none", MY_SPOTLIGHTING)
+MAX_RETRYABLE_CASE_RETRIES = 3
+RETRY_QUEUE_FILENAME = "retry_queue.json"
+RETRYABLE_CASES_PENDING_EXIT_CODE = 3
 
 
 @dataclass(frozen=True)
@@ -236,6 +241,22 @@ class _CandidateProbe(CorpusPayloadAttack):
 
 class BenchmarkTraceError(RuntimeError):
     """Raised when AgentDojo wrote a skipped/errored trace, not a valid run."""
+
+    def __init__(self, raw_path: Path | str, trace_error: object | None = None) -> None:
+        # Calibration and clean-control modules import this exception and use
+        # its historic one-string constructor.  The baseline retry path adds
+        # the raw-path form so it can archive a retryable trace.
+        if trace_error is None:
+            self.raw_path = None
+            self.trace_error = str(raw_path)
+            super().__init__(self.trace_error)
+            return
+        self.raw_path = Path(raw_path)
+        self.trace_error = str(trace_error)
+        super().__init__(
+            f"AgentDojo trace is errored/skipped, not a valid result: {self.raw_path}: "
+            f"{self.trace_error}"
+        )
 
 
 class BaselinePreflightError(RuntimeError):
@@ -514,10 +535,125 @@ def _raw_trace_from_notes(notes: str) -> Path | None:
 def ensure_completed_raw_trace(raw_trace: dict[str, Any], raw_path: Path) -> None:
     """Reject AgentDojo's synthetic verdicts for skipped API-error traces."""
     if raw_trace.get("error"):
-        raise BenchmarkTraceError(
-            f"AgentDojo trace is errored/skipped, not a valid result: {raw_path}: "
-            f"{raw_trace['error']}"
+        raise BenchmarkTraceError(raw_path, raw_trace["error"])
+
+
+def is_retryable_agentdojo_trace_error(error: BenchmarkTraceError) -> bool:
+    """Return whether an AgentDojo skipped trace records a provider HTTP 5xx."""
+
+    return re.search(r"\b5\d{2}\b", error.trace_error) is not None
+
+
+def retry_queue_path(results_path: Path) -> Path:
+    """Keep invalid-but-retryable work beside its model-specific result index."""
+
+    return results_path.parent / RETRY_QUEUE_FILENAME
+
+
+def _retry_queue_case_key(
+    payload: PayloadEntry,
+    domain: str,
+    injection_vector: str,
+    user_task_id: str,
+    injection_task_id: str,
+) -> str:
+    return "\t".join(
+        (payload.id, domain, injection_vector, user_task_id, injection_task_id)
+    )
+
+
+def _load_retry_queue(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        queue = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BaselinePreflightError(f"retry queue is unreadable: {path}") from exc
+    if not isinstance(queue, dict) or any(
+        not isinstance(key, str) or not isinstance(value, dict)
+        for key, value in queue.items()
+    ):
+        raise BaselinePreflightError(f"retry queue has invalid structure: {path}")
+    return queue
+
+
+def _write_retry_queue(path: Path, queue: dict[str, dict[str, Any]]) -> None:
+    atomic_write_json(path, queue)
+
+
+def archive_retryable_trace(
+    *,
+    results_path: Path,
+    payload: PayloadEntry,
+    domain: str,
+    injection_vector: str,
+    user_task_id: str,
+    injection_task_id: str,
+    error: BenchmarkTraceError,
+) -> Path:
+    """Preserve an invalid raw trace and durably leave its case in the retry queue."""
+
+    if error.raw_path is None or not error.raw_path.is_file():
+        raise BaselinePreflightError(
+            f"retryable trace disappeared before archival: {error.raw_path}"
         )
+    queue_path = retry_queue_path(results_path)
+    queue = _load_retry_queue(queue_path)
+    case_key = _retry_queue_case_key(
+        payload, domain, injection_vector, user_task_id, injection_task_id
+    )
+    prior = queue.get(case_key, {})
+    failures = prior.get("failure_count", 0)
+    if not isinstance(failures, int) or failures < 0:
+        raise BaselinePreflightError(
+            f"retry queue has invalid failure_count for case {case_key!r}"
+        )
+    failure_count = failures + 1
+    digest = hashlib.sha256(case_key.encode("utf-8")).hexdigest()
+    archive_path = (
+        results_path.parent
+        / "retryable_traces"
+        / digest
+        / f"attempt-{failure_count}.json"
+    )
+    atomic_write_bytes(archive_path, error.raw_path.read_bytes(), refuse_changed=True)
+    queue[case_key] = {
+        "case": {
+            "payload_id": payload.id,
+            "domain": domain,
+            "injection_vector": injection_vector,
+            "user_task_id": user_task_id,
+            "injection_task_id": injection_task_id,
+        },
+        "failure_count": failure_count,
+        "last_error": error.trace_error,
+        "last_raw_trace": str(error.raw_path.resolve()),
+        "last_archived_trace": str(archive_path.resolve()),
+        "last_failure_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+    }
+    _write_retry_queue(queue_path, queue)
+    return archive_path
+
+
+def clear_retryable_case(
+    results_path: Path,
+    payload: PayloadEntry,
+    domain: str,
+    injection_vector: str,
+    user_task_id: str,
+    injection_task_id: str,
+) -> None:
+    """Remove a queue item only after a valid RunResult has been checkpointed."""
+
+    queue_path = retry_queue_path(results_path)
+    queue = _load_retry_queue(queue_path)
+    case_key = _retry_queue_case_key(
+        payload, domain, injection_vector, user_task_id, injection_task_id
+    )
+    if case_key in queue:
+        del queue[case_key]
+        _write_retry_queue(queue_path, queue)
 
 
 def prune_errored_results(results_path: Path) -> int:
@@ -608,6 +744,27 @@ def case_plan_sha256(
             )
         )
     return hashlib.sha256(handle.getvalue().encode("utf-8")).hexdigest()
+
+
+def verify_expected_plan_sha256(
+    cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
+    expected_sha256: str | None,
+) -> str:
+    """Reject execution when the regenerated ordered plan differs from a frozen plan."""
+
+    actual_sha256 = case_plan_sha256(cases)
+    if expected_sha256 is None:
+        return actual_sha256
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise BaselinePreflightError(
+            "--expected-plan-sha256 must be a lowercase 64-character SHA-256 digest"
+        )
+    if actual_sha256 != expected_sha256:
+        raise BaselinePreflightError(
+            "selected case plan does not match --expected-plan-sha256: "
+            f"expected={expected_sha256}, actual={actual_sha256}"
+        )
+    return actual_sha256
 
 
 def load_committed_phase6_plan(
@@ -955,6 +1112,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plan", action="store_true", help="Print planned cases without invoking the API")
     parser.add_argument("--plan-output", type=Path, help="Optional TSV path for a no-API plan manifest")
     parser.add_argument(
+        "--expected-plan-sha256",
+        help=(
+            "Require the exact ordered selected-case SHA-256 before planning or API execution; "
+            "used to bind a live run to a frozen manifest"
+        ),
+    )
+    parser.add_argument(
         "--matrix",
         choices=("stratified", "full"),
         default="stratified",
@@ -965,6 +1129,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--force-rerun",
         action="store_true",
         help="Rerun non-checkpointed AgentDojo traces even if a raw cache file exists",
+    )
+    parser.add_argument(
+        "--max-case-retries",
+        type=int,
+        default=MAX_RETRYABLE_CASE_RETRIES,
+        help=(
+            "bounded forced reruns after a retryable AgentDojo 5xx trace "
+            f"(default: {MAX_RETRYABLE_CASE_RETRIES}; every retry consumes quota)"
+        ),
     )
     parser.add_argument(
         "--prune-errored-results",
@@ -1034,6 +1207,7 @@ def run_cases(
     completed = completed_cases(results_path, **completed_kwargs)
     plan_sha256 = case_plan_sha256(cases) if args.defense != "none" else None
     executed = 0
+    deferred_retryable_cases = 0
     session_requests_before = get_google_request_attempt_count()
     for payload, domain, vector, user_task_id, injection_task_id in cases:
         key = _case_key(payload.id, domain, vector, user_task_id, injection_task_id)
@@ -1042,52 +1216,97 @@ def run_cases(
             continue
         if args.max_runs is not None and executed >= args.max_runs:
             break
-        try:
-            execution_kwargs: dict[str, Any] = {}
-            if args.defense != "none":
-                execution_kwargs = {
-                    "defense": args.defense,
-                    "plan_sha256": plan_sha256,
-                }
-            record = execute_case(
+        case_retries = 0
+        force_rerun = args.force_rerun
+        while True:
+            try:
+                execution_kwargs: dict[str, Any] = {}
+                if args.defense != "none":
+                    execution_kwargs = {
+                        "defense": args.defense,
+                        "plan_sha256": plan_sha256,
+                    }
+                record = execute_case(
+                    payload,
+                    domain,
+                    vector,
+                    user_task_id,
+                    injection_task_id,
+                    results_path,
+                    target=target,
+                    raw_root=raw_root,
+                    force_rerun=force_rerun,
+                    **execution_kwargs,
+                )
+            except (ClientError, RequestBudgetExceeded) as error:
+                if is_quota_exhausted(error):
+                    print(
+                        "Stopping cleanly: Google API quota/rate/request budget reached. "
+                        f"{executed} completed case(s) remain checkpointed in {results_path}. "
+                        f"This process started {get_google_request_attempt_count() - session_requests_before} "
+                        f"{target.model_name} request attempt(s).",
+                        file=sys.stderr,
+                    )
+                    return 2
+                return _stop_after_unexpected_execution(error)
+            except BenchmarkTraceError as error:
+                if not is_retryable_agentdojo_trace_error(error):
+                    print(
+                        "Stopping cleanly: AgentDojo produced a non-retryable errored/skipped "
+                        f"trace; no RunResult was appended. {error}",
+                        file=sys.stderr,
+                    )
+                    return RETRYABLE_CASES_PENDING_EXIT_CODE
+                archive_path = archive_retryable_trace(
+                    results_path=results_path,
+                    payload=payload,
+                    domain=domain,
+                    injection_vector=vector,
+                    user_task_id=user_task_id,
+                    injection_task_id=injection_task_id,
+                    error=error,
+                )
+                if case_retries >= args.max_case_retries:
+                    deferred_retryable_cases += 1
+                    print(
+                        "Deferred retryable AgentDojo 5xx trace after "
+                        f"{case_retries} forced retry/retries: {key}; archived={archive_path}",
+                        file=sys.stderr,
+                    )
+                    break
+                case_retries += 1
+                force_rerun = True
+                print(
+                    "Retrying retryable AgentDojo 5xx trace "
+                    f"({case_retries}/{args.max_case_retries}): {key}; archived={archive_path}",
+                    file=sys.stderr,
+                )
+                continue
+            except Exception as error:
+                return _stop_after_unexpected_execution(error)
+            clear_retryable_case(
+                results_path,
                 payload,
                 domain,
                 vector,
                 user_task_id,
                 injection_task_id,
-                results_path,
-                target=target,
-                raw_root=raw_root,
-                force_rerun=args.force_rerun,
-                **execution_kwargs,
             )
-        except (ClientError, RequestBudgetExceeded) as error:
-            if is_quota_exhausted(error):
-                print(
-                    "Stopping cleanly: Google API quota/rate/request budget reached. "
-                    f"{executed} completed case(s) remain checkpointed in {results_path}. "
-                    f"This process started {get_google_request_attempt_count() - session_requests_before} "
-                    f"{target.model_name} request attempt(s).",
-                    file=sys.stderr,
-                )
-                return 2
-            return _stop_after_unexpected_execution(error)
-        except BenchmarkTraceError as error:
+            executed += 1
             print(
-                "Stopping cleanly: AgentDojo produced an errored/skipped trace; "
-                f"no RunResult was appended. {error}",
-                file=sys.stderr,
+                f"Recorded {record.run_id}: payload={record.payload_id}, domain={record.domain}, "
+                f"user={record.user_task_id}, injection={record.injection_task_id}, "
+                f"attack_success={record.attack_success}"
             )
-            return 3
-        except Exception as error:
-            return _stop_after_unexpected_execution(error)
-        executed += 1
-        print(
-            f"Recorded {record.run_id}: payload={record.payload_id}, domain={record.domain}, "
-            f"user={record.user_task_id}, injection={record.injection_task_id}, "
-            f"attack_success={record.attack_success}"
-        )
+            break
     print(f"Completed {executed} new baseline case(s); checkpoint: {results_path}")
+    if deferred_retryable_cases:
+        print(
+            f"{deferred_retryable_cases} case(s) remain in {retry_queue_path(results_path)}; "
+            "resume with fresh quota inputs to retry them.",
+            file=sys.stderr,
+        )
+        return RETRYABLE_CASES_PENDING_EXIT_CODE
     return 0
 
 
@@ -1095,14 +1314,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     if args.max_runs is not None and args.max_runs < 1:
         raise SystemExit("--max-runs must be at least 1")
+    if args.max_case_retries < 0:
+        raise SystemExit("--max-case-retries cannot be negative")
     target = BASELINE_TARGETS[args.target]
     payloads = load_corpus()
     cases = select_cases(args, payloads, target)
+    selected_plan_sha256 = verify_expected_plan_sha256(
+        cases, args.expected_plan_sha256
+    )
     if args.plan:
         if args.plan_output:
             write_plan(cases, args.plan_output.resolve())
             print(f"Wrote plan manifest: {args.plan_output.resolve()}")
         print(f"Planned baseline cases: {len(cases)}")
+        print(f"Ordered plan SHA-256: {selected_plan_sha256}")
         for payload, domain, vector, user_task_id, injection_task_id in cases:
             print(f"{payload.id}\t{domain}\t{payload.channel}\t{vector}\t{user_task_id}\t{injection_task_id}")
         return 0

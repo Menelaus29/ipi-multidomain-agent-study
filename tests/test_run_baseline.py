@@ -316,6 +316,66 @@ class RunBaselineTests(unittest.TestCase):
             lines[1],
         )
 
+    def test_expected_plan_hash_accepts_the_exact_ordered_plan(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        cases = [
+            (
+                payload,
+                "workspace",
+                "email_events_injection",
+                "user_task_14",
+                "injection_task_0",
+            )
+        ]
+        expected = run_baseline.case_plan_sha256(cases)
+
+        self.assertEqual(
+            expected,
+            run_baseline.verify_expected_plan_sha256(cases, expected),
+        )
+
+    def test_expected_plan_hash_rejects_malformed_or_changed_plan(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        cases = [
+            (
+                payload,
+                "workspace",
+                "email_events_injection",
+                "user_task_14",
+                "injection_task_0",
+            )
+        ]
+
+        with self.assertRaisesRegex(
+            run_baseline.BaselinePreflightError, "lowercase 64-character"
+        ):
+            run_baseline.verify_expected_plan_sha256(cases, "not-a-digest")
+        with self.assertRaisesRegex(
+            run_baseline.BaselinePreflightError, "selected case plan does not match"
+        ):
+            run_baseline.verify_expected_plan_sha256(cases, "0" * 64)
+
+    def test_changed_plan_is_rejected_before_quota_reservation(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        with (
+            patch.object(run_baseline, "select_cases", return_value=[case]),
+            patch.object(run_baseline, "quota_guard_from_args") as quota_guard,
+            self.assertRaisesRegex(
+                run_baseline.BaselinePreflightError,
+                "selected case plan does not match",
+            ),
+        ):
+            run_baseline.main(["--expected-plan-sha256", "0" * 64])
+
+        quota_guard.assert_not_called()
+
     def test_completed_cases_reads_a_valid_checkpoint(self) -> None:
         record = RunResult(
             run_id="run-1",
@@ -431,6 +491,140 @@ class RunBaselineTests(unittest.TestCase):
                 {"error": "503 UNAVAILABLE", "messages": []},
                 Path("errored.json"),
             )
+
+    def test_retryable_trace_detection_accepts_only_http_5xx(self) -> None:
+        self.assertTrue(
+            run_baseline.is_retryable_agentdojo_trace_error(
+                run_baseline.BenchmarkTraceError(Path("errored.json"), "500 INTERNAL")
+            )
+        )
+        self.assertFalse(
+            run_baseline.is_retryable_agentdojo_trace_error(
+                run_baseline.BenchmarkTraceError(
+                    Path("errored.json"), "400 INVALID_ARGUMENT"
+                )
+            )
+        )
+
+    def test_retryable_trace_is_archived_retried_and_cleared_after_success(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        record = RunResult(
+            run_id="retry-success",
+            timestamp="2026-08-10T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_0",
+            payload_id=payload.id,
+            channel=payload.channel,
+            model="google-gemma-4-26b-a4b-it",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "errored.json"
+            raw_path.write_text(
+                json.dumps({"error": "500 INTERNAL", "messages": []}),
+                encoding="utf-8",
+            )
+            results_path = root / "results.jsonl"
+            with (
+                patch.object(run_baseline, "completed_cases", return_value=set()),
+                patch.object(
+                    run_baseline,
+                    "execute_case",
+                    side_effect=[
+                        run_baseline.BenchmarkTraceError(raw_path, "500 INTERNAL"),
+                        record,
+                    ],
+                ) as execute,
+            ):
+                status = run_baseline.run_cases(
+                    run_baseline.parse_args(["--max-case-retries", "1"]),
+                    [case],
+                    target=run_baseline.GEMMA4_TARGET,
+                    results_path=results_path,
+                    raw_root=root / "raw",
+                )
+
+            self.assertEqual(0, status)
+            self.assertEqual([False, True], [call.kwargs["force_rerun"] for call in execute.call_args_list])
+            archive = next((root / "retryable_traces").rglob("attempt-1.json"))
+            self.assertEqual("500 INTERNAL", json.loads(archive.read_text())["error"])
+            self.assertEqual({}, json.loads(run_baseline.retry_queue_path(results_path).read_text()))
+
+    def test_retryable_trace_exhaustion_defers_case_without_a_result(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        failed_case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        later_case = (
+            payload,
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_1",
+        )
+        later_record = RunResult(
+            run_id="later-case",
+            timestamp="2026-08-10T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_1",
+            payload_id=payload.id,
+            channel=payload.channel,
+            model="google-gemma-4-26b-a4b-it",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "errored.json"
+            raw_path.write_text(
+                json.dumps({"error": "503 UNAVAILABLE", "messages": []}),
+                encoding="utf-8",
+            )
+            results_path = root / "results.jsonl"
+            error = run_baseline.BenchmarkTraceError(raw_path, "503 UNAVAILABLE")
+            with (
+                patch.object(run_baseline, "completed_cases", return_value=set()),
+                patch.object(
+                    run_baseline,
+                    "execute_case",
+                    side_effect=[error, error, later_record],
+                ) as execute,
+            ):
+                status = run_baseline.run_cases(
+                    run_baseline.parse_args(["--max-case-retries", "1"]),
+                    [failed_case, later_case],
+                    target=run_baseline.GEMMA4_TARGET,
+                    results_path=results_path,
+                    raw_root=root / "raw",
+                )
+
+            self.assertEqual(run_baseline.RETRYABLE_CASES_PENDING_EXIT_CODE, status)
+            queue = json.loads(run_baseline.retry_queue_path(results_path).read_text())
+            self.assertEqual(1, len(queue))
+            queued = next(iter(queue.values()))
+            self.assertEqual("pending", queued["status"])
+            self.assertEqual(2, queued["failure_count"])
+            self.assertEqual("injection_task_1", execute.call_args_list[-1].args[4])
+            self.assertFalse(results_path.exists())
 
     def test_prune_errored_results_keeps_only_completed_traces(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

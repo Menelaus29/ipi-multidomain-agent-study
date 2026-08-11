@@ -111,7 +111,11 @@ REQUESTS_PER_MINUTE_SAFETY_TARGET = 14
 MIN_REQUEST_INTERVAL_SECONDS = 4.5
 RPM_RETRY_PAUSE_SECONDS = 65.0
 MAX_RPM_RETRIES = 2
-MAX_TRANSIENT_RETRIES = 2
+# A provider-side 5xx is transient and must be retried before AgentDojo turns
+# it into a synthetic skipped trace.  This is deliberately bounded: every
+# retry is charged to the shared request-attempt limiter and therefore cannot
+# exceed the runner's quota reservation.
+MAX_TRANSIENT_RETRIES = 4
 
 # Gemma's 16k TPM ceiling was reached by multi-turn Workspace diagnostics.
 # Pace against a deliberately lower rolling estimate without changing request
@@ -372,6 +376,25 @@ def classify_quota_error(
     return "unknown"
 
 
+def is_retryable_server_error(error: Exception) -> bool:
+    """Return whether an exception is a transient transport or HTTP 5xx failure.
+
+    The Google SDK normally raises :class:`ServerError` for 5xx responses, but
+    some API paths surface a ``ClientError`` carrying a 5xx status instead.
+    AgentDojo catches both shapes and writes a skipped trace, so recognize the
+    status code here before the benchmark can turn it into a false verdict.
+    """
+
+    if isinstance(error, (ServerError, httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    code = getattr(error, "code", None)
+    try:
+        status = int(code)
+    except (TypeError, ValueError):
+        return False
+    return 500 <= status <= 599
+
+
 class Gemini3LLM(GoogleLLM):
     """GoogleLLM subclass for Gemini 3.x models with thought_signature forwarding.
 
@@ -458,6 +481,20 @@ class Gemini3LLM(GoogleLLM):
             except ClientError as error:
                 if event_observer is not None:
                     event_observer("error", error)
+                if is_retryable_server_error(error):
+                    if transient_retries >= MAX_TRANSIENT_RETRIES:
+                        raise
+                    transient_retries += 1
+                    delay = MIN_REQUEST_INTERVAL_SECONDS * (2 ** (transient_retries - 1))
+                    logging.warning(
+                        "Transient Gemini error %s; waiting %.0fs before retry %d/%d.",
+                        type(error).__name__,
+                        delay,
+                        transient_retries,
+                        MAX_TRANSIENT_RETRIES,
+                    )
+                    self._rate_limiter.defer(delay)
+                    continue
                 quota_kind = classify_quota_error(error)
                 if (
                     quota_kind not in {"rpm", "tpm"}

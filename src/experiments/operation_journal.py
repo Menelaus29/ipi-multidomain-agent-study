@@ -1,9 +1,11 @@
-"""Durable recovery state for Phase 6A AgentDojo API operations.
+"""Durable recovery state for recorded AgentDojo API operations.
 
 The journal is deliberately benchmark-specific.  It records the immutable
 AgentDojo task, model, pipeline, attack, and trace identity before an API call,
 then atomically advances the operation through request, raw-trace, result, and
-JSONL-index states.  It contains no credentials or arbitrary external targets.
+JSONL-index states.  The same recovery boundary is reused by calibration,
+diagnostic, baseline, and defense runners. It contains no credentials or
+arbitrary external targets.
 """
 
 from __future__ import annotations
