@@ -40,16 +40,22 @@ PIPELINE NAME / ATTACK COMPATIBILITY:
 MODEL IDs (verified against official Google documentation, 2026-08-05):
   PRIMARY_MODEL  = 'gemini-3.5-flash-lite' - GA, generateContent supported
   FALLBACK_MODEL = 'gemini-3.1-flash-lite' - GA, generateContent supported
+  GEMMA4_26B_MODEL = 'gemma-4-26b-a4b-it' - isolated Gemma study track
 
 Note (Phase 4.2a): This file will be relocated to src/llm_providers/google_llm_factory.py
 when the full src/ tree is built.
 """
+import json
 import logging
+import math
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Sequence
-from typing import Callable, Literal
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Callable, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -76,14 +82,27 @@ PRIMARY_MODEL = "gemini-3.5-flash-lite"
 # results; a consistent primary keeps all three experiment states comparable.
 FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
+# This hosted Gemma model is an explicit, model-separated target. It is never
+# a fallback and must not enter the Gemini Phase 6/6A calibration artifacts.
+GEMMA4_26B_MODEL = "gemma-4-26b-a4b-it"
+# Compatibility name retained for the already-recorded isolated diagnostic.
+GEMMA4_26B_DIAGNOSTIC_MODEL = GEMMA4_26B_MODEL
+
 # A known AgentDojo MODEL_NAMES key embedded in pipeline.name so that
 # get_model_name_from_pipeline() resolves correctly for ToolKnowledgeAttack
 # and ImportantInstructionsAttack. Resolves to 'AI model developed by Google'.
 _AGENTDOJO_GEMINI_ID = "gemini-2.5-flash-preview-04-17"
+PRIMARY_PIPELINE_NAME = f"google-{PRIMARY_MODEL} [{_AGENTDOJO_GEMINI_ID}]"
+GEMMA4_26B_PIPELINE_NAME = (
+    f"google-{GEMMA4_26B_MODEL} [{_AGENTDOJO_GEMINI_ID}]"
+)
 
 PRIMARY_RPM_LIMIT = 15
 PRIMARY_TPM_LIMIT = 250_000
 PRIMARY_RPD_LIMIT = 500
+GEMMA4_26B_RPM_LIMIT = 30
+GEMMA4_26B_TPM_LIMIT = 16_000
+GEMMA4_26B_RPD_LIMIT = 14_400
 HTTP_REQUEST_TIMEOUT_MS = 120_000
 
 # Pace to 14 RPM, one below the active 15-RPM ceiling. This applies to every
@@ -92,7 +111,66 @@ REQUESTS_PER_MINUTE_SAFETY_TARGET = 14
 MIN_REQUEST_INTERVAL_SECONDS = 4.5
 RPM_RETRY_PAUSE_SECONDS = 65.0
 MAX_RPM_RETRIES = 2
-MAX_TRANSIENT_RETRIES = 2
+# A provider-side 5xx is transient and must be retried before AgentDojo turns
+# it into a synthetic skipped trace.  This is deliberately bounded: every
+# retry is charged to the shared request-attempt limiter and therefore cannot
+# exceed the runner's quota reservation.
+MAX_TRANSIENT_RETRIES = 4
+
+# Gemma's 16k TPM ceiling was reached by multi-turn Workspace diagnostics.
+# Pace against a deliberately lower rolling estimate without changing request
+# content. The estimator is conservative (three UTF-8 bytes/token plus fixed
+# overhead), and the 14k target leaves 12.5% below the dashboard ceiling.
+GEMMA4_TOKEN_SAFETY_TARGET = 14_000
+# Keep a small timing cushion around the provider's nominal 60-second window.
+# The request-level RPM limiter runs after token admission and can otherwise
+# shift the actual send a few seconds beyond the token reservation timestamp.
+TOKEN_WINDOW_SECONDS = 65.0
+APPROX_BYTES_PER_TOKEN = 3
+APPROX_REQUEST_TOKEN_OVERHEAD = 256
+
+_REQUEST_ATTEMPT_OBSERVER: ContextVar[Callable[[int], None] | None] = ContextVar(
+    "google_request_attempt_observer", default=None
+)
+_GENERATE_CONTENT_EVENT_OBSERVER: ContextVar[
+    Callable[[Literal["request", "response", "error"], Any], None] | None
+] = ContextVar("google_generate_content_event_observer", default=None)
+
+
+@contextmanager
+def observe_google_request_attempts(observer: Callable[[int], None]):
+    """Notify one operation journal after every provider request start.
+
+    The callback runs after the process-wide request counter is incremented and
+    before the HTTP request is issued.  Recording at this boundary makes retry
+    accounting durable even if the process is interrupted before an enclosing
+    AgentDojo benchmark call returns.
+    """
+
+    token = _REQUEST_ATTEMPT_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _REQUEST_ATTEMPT_OBSERVER.reset(token)
+
+
+@contextmanager
+def observe_google_generate_content_events(
+    observer: Callable[[Literal["request", "response", "error"], Any], None],
+):
+    """Observe exact SDK request/response objects for a scoped diagnostic.
+
+    Normal experiment paths do not install this observer.  It does not alter
+    message construction, tool schemas, retry policy, or provider selection;
+    it only makes the already-constructed Google SDK payload observable when a
+    caller explicitly requests a trace.
+    """
+
+    token = _GENERATE_CONTENT_EVENT_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _GENERATE_CONTENT_EVENT_OBSERVER.reset(token)
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -139,6 +217,10 @@ class RequestRateLimiter:
             started_at = self._clock()
             self._next_request_at = started_at + self.min_interval_seconds
             self._requests_started += 1
+            requests_started = self._requests_started
+        observer = _REQUEST_ATTEMPT_OBSERVER.get()
+        if observer is not None:
+            observer(requests_started)
 
     def defer(self, seconds: float) -> None:
         """Prevent any request from starting until at least ``seconds`` later."""
@@ -162,7 +244,102 @@ class RequestRateLimiter:
             return self._requests_started
 
 
+def _token_estimate_json_default(value: Any) -> Any:
+    """Return a stable JSON-compatible approximation of Google SDK objects."""
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json", exclude_none=True)
+        except TypeError:
+            return model_dump(exclude_none=True)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return str(value)
+
+
+def approximate_request_tokens(
+    google_messages: genai_types.ContentListUnion,
+    generation_config: genai_types.GenerateContentConfig,
+) -> int:
+    """Conservatively estimate tokens sent without making a count-tokens call.
+
+    The estimate includes the exact message history and tool/config payload that
+    will be sent. It does not mutate or truncate either object.
+    """
+
+    serialized = json.dumps(
+        {"contents": google_messages, "config": generation_config},
+        default=_token_estimate_json_default,
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    return max(
+        1,
+        math.ceil(len(serialized) / APPROX_BYTES_PER_TOKEN)
+        + APPROX_REQUEST_TOKEN_OVERHEAD,
+    )
+
+
+class TokenWindowPacer:
+    """Bound approximate input tokens in a process-local rolling window."""
+
+    def __init__(
+        self,
+        max_tokens: int,
+        *,
+        window_seconds: float = TOKEN_WINDOW_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        if window_seconds <= 0:
+            raise ValueError("window_seconds must be positive")
+        self.max_tokens = max_tokens
+        self.window_seconds = window_seconds
+        self._clock = clock
+        self._sleeper = sleeper
+        self._events: deque[tuple[float, int]] = deque()
+        self._lock = threading.Lock()
+
+    def _discard_expired(self, now: float) -> None:
+        while self._events and now - self._events[0][0] >= self.window_seconds:
+            self._events.popleft()
+
+    def wait_before_tokens(self, estimated_tokens: int) -> float:
+        """Wait until a turn fits, then reserve its approximate token charge.
+
+        A single estimated request larger than the safety target is admitted
+        only into an empty window and charged at the full target. That avoids an
+        infinite wait while preserving the unmodified benchmark request; the
+        provider remains the authority on its actual token count.
+        """
+
+        if estimated_tokens < 1:
+            raise ValueError("estimated_tokens must be positive")
+        charge = min(estimated_tokens, self.max_tokens)
+        waited = 0.0
+        with self._lock:
+            while True:
+                now = self._clock()
+                self._discard_expired(now)
+                used = sum(tokens for _, tokens in self._events)
+                fits = used + charge <= self.max_tokens
+                oversized_and_empty = estimated_tokens > self.max_tokens and not self._events
+                if fits or oversized_and_empty:
+                    self._events.append((now, charge))
+                    return waited
+                delay = max(0.0, self._events[0][0] + self.window_seconds - now)
+                if delay == 0:
+                    continue
+                self._sleeper(delay)
+                waited += delay
+
+
 _REQUEST_RATE_LIMITER = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
+_GEMMA4_TOKEN_PACER = TokenWindowPacer(GEMMA4_TOKEN_SAFETY_TARGET)
 
 
 def get_google_request_attempt_count() -> int:
@@ -177,7 +354,7 @@ def configure_google_request_attempt_limit(max_requests: int | None) -> None:
 
 def classify_quota_error(
     error: ClientError,
-) -> Literal["rpm", "rpd", "unknown"] | None:
+) -> Literal["rpm", "tpm", "rpd", "unknown"] | None:
     """Classify a Google 429 from its structured details/message when possible."""
     if getattr(error, "code", None) != 429 and "429" not in str(error):
         return None
@@ -188,9 +365,34 @@ def classify_quota_error(
     compact = details.replace("_", "").replace("-", "").replace(" ", "")
     if "requestsperday" in compact or "perday" in compact or "rpd" in compact:
         return "rpd"
-    if "requestsperminute" in compact or "perminute" in compact or "rpm" in compact:
+    if (
+        "tokensperminute" in compact
+        or ("tokens" in compact and "perminute" in compact)
+        or "tpm" in compact
+    ):
+        return "tpm"
+    if "requestsperminute" in compact or "rpm" in compact:
         return "rpm"
     return "unknown"
+
+
+def is_retryable_server_error(error: Exception) -> bool:
+    """Return whether an exception is a transient transport or HTTP 5xx failure.
+
+    The Google SDK normally raises :class:`ServerError` for 5xx responses, but
+    some API paths surface a ``ClientError`` carrying a 5xx status instead.
+    AgentDojo catches both shapes and writes a skipped trace, so recognize the
+    status code here before the benchmark can turn it into a false verdict.
+    """
+
+    if isinstance(error, (ServerError, httpx.TimeoutException, httpx.ConnectError)):
+        return True
+    code = getattr(error, "code", None)
+    try:
+        status = int(code)
+    except (TypeError, ValueError):
+        return False
+    return 500 <= status <= 599
 
 
 class Gemini3LLM(GoogleLLM):
@@ -218,9 +420,11 @@ class Gemini3LLM(GoogleLLM):
         client: genai.Client,
         *,
         rate_limiter: RequestRateLimiter | None = None,
+        token_pacer: TokenWindowPacer | None = None,
     ) -> None:
         super().__init__(model, client)
         self._rate_limiter = rate_limiter or _REQUEST_RATE_LIMITER
+        self._token_pacer = token_pacer
 
     def _generate_content(
         self,
@@ -228,31 +432,89 @@ class Gemini3LLM(GoogleLLM):
         generation_config: genai_types.GenerateContentConfig,
     ) -> genai_types.GenerateContentResponse:
         """Call Gemini with request-level pacing and bounded transient retries."""
-        rpm_retries = 0
+        minute_quota_retries = 0
         transient_retries = 0
+        estimated_tokens = (
+            approximate_request_tokens(google_messages, generation_config)
+            if self._token_pacer is not None
+            else None
+        )
+        if (
+            estimated_tokens is not None
+            and estimated_tokens > self._token_pacer.max_tokens
+        ):
+            logging.warning(
+                "Estimated request size %d exceeds the Gemma rolling safety target %d; "
+                "sending the unchanged request only after an empty token window.",
+                estimated_tokens,
+                self._token_pacer.max_tokens,
+            )
         while True:
+            if self._token_pacer is not None and estimated_tokens is not None:
+                token_delay = self._token_pacer.wait_before_tokens(estimated_tokens)
+                if token_delay > 0:
+                    logging.info(
+                        "Gemma token pacing waited %.1fs before an estimated %d-token turn.",
+                        token_delay,
+                        estimated_tokens,
+                    )
             self._rate_limiter.wait_before_request()
+            event_observer = _GENERATE_CONTENT_EVENT_OBSERVER.get()
+            if event_observer is not None:
+                event_observer(
+                    "request",
+                    {
+                        "model": self.model,
+                        "contents": google_messages,
+                        "config": generation_config,
+                    },
+                )
             try:
-                return self.client.models.generate_content(
+                response = self.client.models.generate_content(
                     model=self.model,
                     contents=google_messages,
                     config=generation_config,
                 )
+                if event_observer is not None:
+                    event_observer("response", response)
+                return response
             except ClientError as error:
+                if event_observer is not None:
+                    event_observer("error", error)
+                if is_retryable_server_error(error):
+                    if transient_retries >= MAX_TRANSIENT_RETRIES:
+                        raise
+                    transient_retries += 1
+                    delay = MIN_REQUEST_INTERVAL_SECONDS * (2 ** (transient_retries - 1))
+                    logging.warning(
+                        "Transient Gemini error %s; waiting %.0fs before retry %d/%d.",
+                        type(error).__name__,
+                        delay,
+                        transient_retries,
+                        MAX_TRANSIENT_RETRIES,
+                    )
+                    self._rate_limiter.defer(delay)
+                    continue
                 quota_kind = classify_quota_error(error)
-                if quota_kind != "rpm" or rpm_retries >= MAX_RPM_RETRIES:
+                if (
+                    quota_kind not in {"rpm", "tpm"}
+                    or minute_quota_retries >= MAX_RPM_RETRIES
+                ):
                     # Daily and ambiguous quota errors must reach the baseline
                     # runner, which stops without writing an invalid result.
                     raise
-                rpm_retries += 1
+                minute_quota_retries += 1
                 logging.warning(
-                    "Gemini per-minute quota reached; waiting %.0fs before retry %d/%d.",
+                    "Google %s quota reached; waiting %.0fs before retry %d/%d.",
+                    quota_kind.upper(),
                     RPM_RETRY_PAUSE_SECONDS,
-                    rpm_retries,
+                    minute_quota_retries,
                     MAX_RPM_RETRIES,
                 )
                 self._rate_limiter.defer(RPM_RETRY_PAUSE_SECONDS)
             except (ServerError, httpx.TimeoutException, httpx.ConnectError) as error:
+                if event_observer is not None:
+                    event_observer("error", error)
                 if transient_retries >= MAX_TRANSIENT_RETRIES:
                     raise
                 transient_retries += 1
@@ -357,7 +619,13 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
             retry_options=genai_types.HttpRetryOptions(attempts=1),
         ),
     )
-    llm = Gemini3LLM(model_name, client)
+    llm = Gemini3LLM(
+        model_name,
+        client,
+        token_pacer=(
+            _GEMMA4_TOKEN_PACER if model_name == GEMMA4_26B_MODEL else None
+        ),
+    )
     # Name format: "google-<model_name> [gemini-2.5-flash-preview-04-17]"
     # get_model_name_from_pipeline() matches the bracketed key -> 'AI model developed by Google'
     llm.name = f"google-{model_name} [{_AGENTDOJO_GEMINI_ID}]"
@@ -376,6 +644,23 @@ def get_google_fallback_llm() -> Gemini3LLM:
     Use only for non-recorded diagnostics when the primary is unavailable.
     """
     return get_google_llm(FALLBACK_MODEL)
+
+
+def get_google_gemma4_26b_llm() -> Gemini3LLM:
+    """Return the explicit model-separated Gemma 4 target.
+
+    This changes only the model identifier passed to the existing
+    ``Gemini3LLM``/Google AI Studio client path. It is intentionally separate
+    from both primary and fallback factories and enables Gemma-only TPM pacing.
+    """
+
+    return get_google_llm(GEMMA4_26B_MODEL)
+
+
+def get_google_gemma4_26b_diagnostic_llm() -> Gemini3LLM:
+    """Compatibility factory for the isolated Gemma delivery diagnostic."""
+
+    return get_google_gemma4_26b_llm()
 
 
 class FallbackGemini3LLM(Gemini3LLM):
