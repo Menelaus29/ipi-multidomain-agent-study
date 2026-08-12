@@ -755,18 +755,13 @@ def reconcile_artifacts(
             raise AggregationError(
                 f"{trace_path}.security disagrees with indexed attack_success"
             )
+        # Legacy baseline indexes omitted utility and therefore carry null;
+        # newer indexes preserve AgentDojo's native boolean. Raw traces are
+        # authoritative in both cases, and any populated index value must
+        # agree exactly with the trace.
         if result.utility_success is not None and utility_success != result.utility_success:
             raise AggregationError(
                 f"{trace_path}.utility disagrees with indexed utility_success"
-            )
-        if (
-            plan_sha == GEMMA_FOLLOWUP_PLAN_SHA256
-            and result.defense == "none"
-            and result.utility_success is not None
-        ):
-            raise AggregationError(
-                f"{source}.utility_success must remain null for the undefended "
-                "Gemma follow-up; utility is derived from the raw trace"
             )
         if reference_plan_path is None:
             declared_partition = "static"

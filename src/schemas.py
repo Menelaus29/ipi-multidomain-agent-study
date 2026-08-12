@@ -624,11 +624,11 @@ class RunResult:
         defense_sha256 = _optional_sha256(record, "defense_sha256", path=path)
         defense = _require_string(record, "defense", path=path)
 
-        if (split is None) != (utility_success is None):
-            raise SchemaValidationError(
-                f"{path}.split and {path}.utility_success must be populated together"
-            )
-        if plan_sha256 is not None and split is None:
+        # Utility is an observed AgentDojo verdict, whereas split is study
+        # provenance. They are intentionally independent for generic baseline
+        # rows. Legacy rows may omit both; future undefended rows may record
+        # utility without declaring a development/holdout split.
+        if plan_sha256 is not None and (split is None or utility_success is None):
             raise SchemaValidationError(
                 f"{path}.plan_sha256 requires split and utility_success"
             )

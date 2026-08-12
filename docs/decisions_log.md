@@ -123,3 +123,11 @@ is permanently bypassed in favour of the Python API.
 **Reason:** The shared runner already separates defended outputs by model and defense version, and the short `g4/v1` namespace preserves the tested Windows trace-path margin. This is a storage/provenance clarification only: defended Gemma rows remain separate from Gemini, calibrated-baseline, and original discovery datasets.
 
 **Impact:** Phase 9 uses `data/defended/g4/v1/{builtin_dev,custom_dev,full}/`; every defended row must retain the Gemma model, follow-up plan, payload, and defense hashes, with the 20 repetition and 160 fresh partitions reported separately.
+
+### Phase 7/9 — Preserve native utility in future undefended indexes
+
+**Decision:** Record AgentDojo's native `utility_success` boolean in every future undefended baseline index row while preserving all existing Gemini and Gemma baseline indexes and raw traces byte-for-byte as legacy artifacts.
+
+**Reason:** The shared runner always received and raw-logged the native utility verdict, but its defense integration serialized that value only for defended rows. The later documentation described the resulting undefended nulls as "by design," even though they were a legacy serialization omission rather than an experimental or methodological requirement.
+
+**Impact:** Future undefended runs carry utility without requiring a development/holdout split; schemas and aggregation accept both legacy null and future boolean values, and populated values are checked against raw traces. Frozen `data/baseline/`, `data/baseline_gemma4/results.jsonl`, `data/baseline_gemma4/full/results.jsonl`, and all existing raw traces remain unchanged.
