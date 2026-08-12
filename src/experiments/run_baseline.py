@@ -48,7 +48,7 @@ import sys
 import time
 import uuid
 from collections import Counter
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -489,6 +489,11 @@ def completed_cases(
     *,
     expected_model: str | None = None,
     expected_defense: str | None = None,
+    expected_split: str | None = None,
+    expected_plan_sha256: str | None = None,
+    expected_defense_version: str | None = None,
+    expected_defense_sha256: str | None = None,
+    expected_attack_sha256_by_case: Mapping[tuple[str, ...], str] | None = None,
 ) -> set[tuple[str, ...]]:
     """Read checkpoint keys from an existing results JSONL file."""
     if not results_path.exists():
@@ -515,7 +520,36 @@ def completed_cases(
         vector = _vector_from_notes(result.notes)
         if vector is None:
             raise SchemaValidationError(f"{results_path}:{line_number} lacks an injection_vector note")
-        completed.add(_case_key(result.payload_id, result.domain, vector, result.user_task_id, result.injection_task_id))
+        key = _case_key(
+            result.payload_id,
+            result.domain,
+            vector,
+            result.user_task_id,
+            result.injection_task_id,
+        )
+        for field, actual, expected in (
+            ("split", result.split, expected_split),
+            ("plan_sha256", result.plan_sha256, expected_plan_sha256),
+            ("defense_version", result.defense_version, expected_defense_version),
+            ("defense_sha256", result.defense_sha256, expected_defense_sha256),
+        ):
+            if expected is not None and actual != expected:
+                raise SchemaValidationError(
+                    f"{results_path}:{line_number} has {field} {actual!r}; "
+                    f"expected {expected!r}"
+                )
+        if expected_attack_sha256_by_case is not None:
+            expected_attack_sha256 = expected_attack_sha256_by_case.get(key)
+            if expected_attack_sha256 is None:
+                raise SchemaValidationError(
+                    f"{results_path}:{line_number} is not present in the current ordered plan"
+                )
+            if result.attack_sha256 != expected_attack_sha256:
+                raise SchemaValidationError(
+                    f"{results_path}:{line_number} has attack_sha256 "
+                    f"{result.attack_sha256!r}; expected {expected_attack_sha256!r}"
+                )
+        completed.add(key)
     return completed
 
 
@@ -746,6 +780,30 @@ def case_plan_sha256(
     return hashlib.sha256(handle.getvalue().encode("utf-8")).hexdigest()
 
 
+def defended_attack_sha256_by_case(
+    cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
+) -> dict[tuple[str, ...], str]:
+    """Return the expected rendered-attack hash for every defended plan row."""
+
+    suites: dict[str, Any] = {}
+    hashes: dict[tuple[str, ...], str] = {}
+    for payload, domain, vector, user_task_id, injection_task_id in cases:
+        if domain not in suites:
+            suites[domain] = get_suite(BENCHMARK_VERSION, domain)
+        suite = suites[domain]
+        injection_task = suite.injection_tasks.get(injection_task_id)
+        if injection_task is None:
+            raise BaselinePreflightError(
+                f"unknown injection task {injection_task_id!r} for {domain!r}"
+            )
+        rendered_attack = render_payload(payload, injection_task.GOAL)
+        key = _case_key(
+            payload.id, domain, vector, user_task_id, injection_task_id
+        )
+        hashes[key] = hashlib.sha256(rendered_attack.encode("utf-8")).hexdigest()
+    return hashes
+
+
 def verify_expected_plan_sha256(
     cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
     expected_sha256: str | None,
@@ -883,7 +941,10 @@ def target_results_path(
 
 
 def target_raw_root(
-    target: BaselineTarget, matrix: str, defense: str = "none"
+    target: BaselineTarget,
+    matrix: str,
+    defense: str = "none",
+    requested_results: Path | None = None,
 ) -> Path:
     if defense == "none":
         matrix_root = (
@@ -891,6 +952,8 @@ def target_raw_root(
             if matrix == "stratified"
             else target.output_root / "full"
         )
+    elif requested_results is not None:
+        matrix_root = requested_results.resolve().parent
     else:
         matrix_root = defended_target_root(target)
         if matrix == "full":
@@ -926,9 +989,11 @@ def validate_output_isolation(
 
     resolved = results_path.resolve()
     if defense != "none":
-        if not _is_relative_to(resolved, DEFENDED_ROOT):
+        expected_root = defended_target_root(target)
+        if not _is_relative_to(resolved, expected_root):
             raise BaselinePreflightError(
-                f"defended output must remain below {DEFENDED_ROOT}: {resolved}"
+                f"{target.model_name} defended output must remain below "
+                f"{expected_root}: {resolved}"
             )
         return
     if target == GEMMA4_TARGET:
@@ -1004,9 +1069,34 @@ def execute_case(
     raw_root: Path = RAW_ROOT,
     force_rerun: bool = False,
     defense: str = "none",
+    split: str | None = None,
     plan_sha256: str | None = None,
+    defense_sha256: str | None = None,
 ) -> RunResult:
     """Run one AgentDojo task attempt and append its validated JSONL record."""
+    is_defended = defense == MY_SPOTLIGHTING
+    if is_defended:
+        if split not in {"dev", "holdout"}:
+            raise BaselinePreflightError(
+                "my_spotlighting execution requires split='dev' or split='holdout'"
+            )
+        if plan_sha256 is None or re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
+            raise BaselinePreflightError(
+                "my_spotlighting execution requires the ordered plan SHA-256"
+            )
+        if defense_sha256 is None:
+            defense_sha256 = defense_source_sha256()
+        if re.fullmatch(r"[0-9a-f]{64}", defense_sha256) is None:
+            raise BaselinePreflightError(
+                "my_spotlighting execution requires a valid defense SHA-256"
+            )
+    elif defense != "none":
+        raise BaselinePreflightError(f"unsupported defense mode: {defense!r}")
+    elif any(value is not None for value in (split, plan_sha256, defense_sha256)):
+        raise BaselinePreflightError(
+            "undefended execution must not receive defended-run provenance"
+        )
+
     suite = get_suite(BENCHMARK_VERSION, domain)
     attack_name = register_payload_attack(payload, injection_vector)
     # AgentDojo's injection-task utility traces use the "none" attack path.
@@ -1019,10 +1109,8 @@ def execute_case(
     requests_before = get_google_request_attempt_count()
     started_at = time.monotonic()
     target_llm = get_target_llm(target)
-    if defense == MY_SPOTLIGHTING:
+    if is_defended:
         target_llm = MySpotlightingLLM(target_llm)
-    elif defense != "none":
-        raise BaselinePreflightError(f"unsupported defense mode: {defense!r}")
     results = benchmark_suite(
         suite=suite,
         # AgentDojo's runtime accepts a constructed BasePipelineElement here,
@@ -1042,11 +1130,6 @@ def execute_case(
     relative_raw_path = raw_path.relative_to(PROJECT_ROOT).as_posix()
     api_request_attempts = get_google_request_attempt_count() - requests_before
     elapsed_seconds = time.monotonic() - started_at
-    is_defended = defense == MY_SPOTLIGHTING
-    if is_defended and plan_sha256 is None:
-        raise BaselinePreflightError(
-            "my_spotlighting execution requires the ordered plan SHA-256"
-        )
     rendered_attack = (
         render_payload(payload, suite.injection_tasks[injection_task_id].GOAL)
         if is_defended
@@ -1081,12 +1164,12 @@ def execute_case(
             if is_defended
             else None
         ),
-        split="holdout" if is_defended else None,
+        split=split if is_defended else None,
         attack_set_version="static-corpus-v1" if is_defended else None,
         attack_sha256=attack_sha256,
         plan_sha256=plan_sha256 if is_defended else None,
         defense_version=MY_SPOTLIGHTING_VERSION if is_defended else None,
-        defense_sha256=defense_source_sha256() if is_defended else None,
+        defense_sha256=defense_sha256 if is_defended else None,
     )
     RunResult.from_dict(record.__dict__, path="generated RunResult")
     results_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1108,6 +1191,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=DEFENSE_MODES,
         default="none",
         help="select the additive custom defense; defaults to the unchanged undefended path",
+    )
+    parser.add_argument(
+        "--split",
+        choices=("dev", "holdout"),
+        help=(
+            "required for defended API execution so development validation and "
+            "held-out evaluation cannot be conflated"
+        ),
     )
     parser.add_argument("--plan", action="store_true", help="Print planned cases without invoking the API")
     parser.add_argument("--plan-output", type=Path, help="Optional TSV path for a no-API plan manifest")
@@ -1199,13 +1290,26 @@ def run_cases(
     if args.prune_errored_results:
         removed = prune_errored_results(results_path)
         print(f"Pruned {removed} errored/skipped checkpoint row(s) from {results_path}")
-    completed_kwargs: dict[str, str] = {
+    is_defended = args.defense == MY_SPOTLIGHTING
+    plan_sha256 = case_plan_sha256(cases) if is_defended else None
+    current_defense_sha256 = defense_source_sha256() if is_defended else None
+    completed_kwargs: dict[str, Any] = {
         "expected_model": f"google-{target.model_name}"
     }
-    if args.defense != "none":
-        completed_kwargs["expected_defense"] = args.defense
+    if is_defended:
+        completed_kwargs.update(
+            {
+                "expected_defense": args.defense,
+                "expected_split": args.split,
+                "expected_plan_sha256": plan_sha256,
+                "expected_defense_version": MY_SPOTLIGHTING_VERSION,
+                "expected_defense_sha256": current_defense_sha256,
+                "expected_attack_sha256_by_case": defended_attack_sha256_by_case(
+                    cases
+                ),
+            }
+        )
     completed = completed_cases(results_path, **completed_kwargs)
-    plan_sha256 = case_plan_sha256(cases) if args.defense != "none" else None
     executed = 0
     deferred_retryable_cases = 0
     session_requests_before = get_google_request_attempt_count()
@@ -1221,10 +1325,12 @@ def run_cases(
         while True:
             try:
                 execution_kwargs: dict[str, Any] = {}
-                if args.defense != "none":
+                if is_defended:
                     execution_kwargs = {
                         "defense": args.defense,
+                        "split": args.split,
                         "plan_sha256": plan_sha256,
+                        "defense_sha256": current_defense_sha256,
                     }
                 record = execute_case(
                     payload,
@@ -1316,6 +1422,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--max-runs must be at least 1")
     if args.max_case_retries < 0:
         raise SystemExit("--max-case-retries cannot be negative")
+    if args.defense == "none" and args.split is not None:
+        raise SystemExit("--split is valid only with a defended run")
+    if args.defense != "none" and not args.plan and args.split is None:
+        raise SystemExit("defended API execution requires --split dev or --split holdout")
     target = BASELINE_TARGETS[args.target]
     payloads = load_corpus()
     cases = select_cases(args, payloads, target)
@@ -1335,7 +1445,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     results_path = target_results_path(
         target, args.matrix, args.results_path, args.defense
     )
-    raw_root = target_raw_root(target, args.matrix, args.defense)
+    raw_root = target_raw_root(
+        target, args.matrix, args.defense, args.results_path
+    )
     validate_output_isolation(target, results_path, args.defense)
     longest_path = preflight_trace_paths(cases, target=target, raw_root=raw_root)
     print(

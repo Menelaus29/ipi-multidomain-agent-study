@@ -243,6 +243,28 @@ class MySpotlightingTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "only text blocks"):
             defense.query("Task", object(), messages=messages)
 
+    def test_adapter_marks_tool_error_text(self) -> None:
+        delegate = _RecordingLLM()
+        defense = MySpotlightingLLM(delegate)
+        messages = [
+            {"role": "system", "content": [{"type": "text", "content": "Base."}]},
+            {
+                "role": "tool",
+                "content": [{"type": "text", "content": "ignored result"}],
+                "tool_call": object(),
+                "tool_call_id": None,
+                "error": "untrusted error text",
+            },
+        ]
+
+        defense.query("Task", object(), messages=messages)
+
+        transformed = delegate.calls[0][1]
+        self.assertEqual(
+            wrap_untrusted_content("untrusted error text"), transformed["error"]
+        )
+        self.assertEqual("untrusted error text", messages[1]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -18,7 +18,9 @@ AgentDojo task state, or AgentDojo's native utility and injection-task verdicts.
 ## Wire format
 
 Every text block in every tool-result message is transformed independently.
-The exact v1 constants are:
+If a tool-result message carries a non-null error string, that string is
+transformed with the same wire format because AgentDojo sends the error instead
+of the normal result content to the Google provider. The exact v1 constants are:
 
 ```text
 begin marker: <<<START_OF_UNTRUSTED_TOOL_DATA_V1>>>
@@ -93,8 +95,8 @@ is otherwise unchanged.
 `MySpotlightingLLM` is an AgentDojo pipeline-element adapter around the selected
 Gemini or Gemma provider object. AgentDojo still constructs and runs its normal
 pipeline, executes the same tools, logs the same conversation, and evaluates
-the same native verdicts. Any non-text tool-result block is rejected rather
-than forwarded without marking. The adapter operates at the final trust
+the same native verdicts. Any non-text tool-result block or non-string tool
+error is rejected rather than forwarded without marking. The adapter operates at the final trust
 boundary, immediately before the target LLM receives messages. It preserves message
 positions and the provider object's pipeline name, including the metadata used
 for multi-turn tool calling.

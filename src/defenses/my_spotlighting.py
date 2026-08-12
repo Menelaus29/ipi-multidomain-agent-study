@@ -142,6 +142,14 @@ def _mark_tool_message(message: ChatMessage) -> ChatMessage:
             raise TypeError("tool text content must be a string")
         updated_block["content"] = wrap_untrusted_content(text)
         content.append(updated_block)
+    error = updated.get("error")
+    if error is not None:
+        if not isinstance(error, str):
+            raise TypeError("tool error content must be a string or null")
+        # AgentDojo's Google serializer sends ``error`` instead of ``content``
+        # for failed tool calls. Mark it at the same trust boundary so an error
+        # string cannot bypass the policy applied to successful tool results.
+        updated["error"] = wrap_untrusted_content(error)
     updated["content"] = content
     return updated  # type: ignore[return-value]
 

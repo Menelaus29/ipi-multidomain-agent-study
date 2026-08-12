@@ -22,7 +22,7 @@ across fresh Gemma 4 Banking file contexts and native injection goals?
 - Target: `google-gemma-4-26b-a4b-it`
 - AgentDojo benchmark: `v1.2.2`
 - Defense: `my_spotlighting` version `v1`
-- Defense SHA-256: `fa431e4aef6c184e895149fbd15358d651b8ac6f708ba01f1da4f369002bdfeb`
+- Defense SHA-256: `7c3a33f0d95d87487838e908351c1ce7ce488b1e4a559207f3f65b3122cc33f7`
 - Ordered follow-up plan: `data/baseline_gemma4/banking_followup/plan.tsv`
 - Ordered plan SHA-256: `bc3e39fc087979621b57a2b85401912430fe83fc08c39cab980dcf2862e56b74`
 - Discovery plan: `data/baseline/plan.tsv`

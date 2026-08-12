@@ -153,6 +153,36 @@ class RunBaselineTests(unittest.TestCase):
                 run_baseline.GEMMA4_BASELINE_ROOT / "results.jsonl",
                 run_baseline.MY_SPOTLIGHTING,
             )
+        with self.assertRaises(run_baseline.BaselinePreflightError):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                run_baseline.DEFENDED_ROOT / "g35" / "v1" / "results.jsonl",
+                run_baseline.MY_SPOTLIGHTING,
+            )
+
+    def test_custom_defense_places_raw_traces_beside_requested_index(self) -> None:
+        requested = (
+            run_baseline.DEFENDED_ROOT
+            / "g4"
+            / "v1"
+            / "custom_dev"
+            / "results.jsonl"
+        )
+
+        raw_root = run_baseline.target_raw_root(
+            run_baseline.GEMMA4_TARGET,
+            "full",
+            run_baseline.MY_SPOTLIGHTING,
+            requested,
+        )
+
+        self.assertEqual(requested.parent / "r", raw_root)
+
+    def test_defended_execution_requires_an_explicit_split(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires --split"):
+            run_baseline.main(
+                ["--target", "gemma4-26b", "--defense", run_baseline.MY_SPOTLIGHTING]
+            )
 
     def test_gemma_output_isolation_rejects_gemini_directories(self) -> None:
         for path in (
@@ -424,6 +454,52 @@ class RunBaselineTests(unittest.TestCase):
                     path, expected_defense=run_baseline.MY_SPOTLIGHTING
                 )
 
+    def test_completed_cases_rejects_stale_defended_provenance(self) -> None:
+        key = (
+            "direct-01",
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        record = RunResult(
+            run_id="run-1",
+            timestamp="2026-08-04T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_0",
+            payload_id="direct-01",
+            channel="email_body",
+            model="google-gemma-4-26b-a4b-it",
+            defense=run_baseline.MY_SPOTLIGHTING,
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+            utility_success=True,
+            split="dev",
+            attack_set_version="static-corpus-v1",
+            attack_sha256="b" * 64,
+            plan_sha256="a" * 64,
+            defense_version=run_baseline.MY_SPOTLIGHTING_VERSION,
+            defense_sha256="c" * 64,
+        )
+        expectations = (
+            {"expected_split": "holdout"},
+            {"expected_plan_sha256": "d" * 64},
+            {"expected_defense_version": "v2"},
+            {"expected_defense_sha256": "e" * 64},
+            {"expected_attack_sha256_by_case": {key: "f" * 64}},
+            {"expected_attack_sha256_by_case": {}},
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "results.jsonl"
+            path.write_text(json.dumps(record.__dict__) + "\n", encoding="utf-8")
+            for expected in expectations:
+                with self.subTest(expected=expected), self.assertRaises(
+                    run_baseline.SchemaValidationError
+                ):
+                    run_baseline.completed_cases(path, **expected)
+
     def test_execute_case_wires_custom_adapter_and_provenance_without_network(self) -> None:
         payload = run_baseline.load_corpus()[0]
         suite = _FakeSuite("workspace")
@@ -464,6 +540,7 @@ class RunBaselineTests(unittest.TestCase):
                     results_path,
                     raw_root=root,
                     defense=run_baseline.MY_SPOTLIGHTING,
+                    split="dev",
                     plan_sha256="a" * 64,
                 )
 
@@ -473,7 +550,7 @@ class RunBaselineTests(unittest.TestCase):
         self.assertEqual(run_baseline.MY_SPOTLIGHTING, record.defense)
         self.assertEqual(run_baseline.MY_SPOTLIGHTING_VERSION, record.defense_version)
         self.assertEqual("static-corpus-v1", record.attack_set_version)
-        self.assertEqual("holdout", record.split)
+        self.assertEqual("dev", record.split)
         self.assertTrue(record.utility_success)
 
     def test_quota_detection_requires_a_google_429(self) -> None:
