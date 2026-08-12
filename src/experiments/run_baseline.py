@@ -102,6 +102,11 @@ GEMINI_BASELINE_ROOT = PROJECT_ROOT / "data" / "baseline"
 GEMMA4_BASELINE_ROOT = PROJECT_ROOT / "data" / "baseline_gemma4"
 CALIBRATED_BASELINE_ROOT = PROJECT_ROOT / "data" / "calibrated_baseline"
 DEFENDED_ROOT = PROJECT_ROOT / "data" / "defended"
+PHASE9_GEMMA_V1_ROOT = DEFENDED_ROOT / "g4" / "v1"
+PHASE9_DEV_MANIFEST_PATH = PHASE9_GEMMA_V1_ROOT / "dev_manifest.tsv"
+PHASE9_DEV_PLAN_SHA256 = (
+    "df0826f7cb52050f19a8a3d536ee8a6dbcd669ffb8deea49b7f40da2039669ef"
+)
 DEFAULT_OUTPUT = GEMINI_BASELINE_ROOT / "results.jsonl"
 RAW_ROOT = GEMINI_BASELINE_ROOT / "raw"
 BENCHMARK_VERSION = "v1.2.2"
@@ -1129,6 +1134,19 @@ def validate_output_isolation(
                     f"{defense} development output must remain below "
                     f"{expected_development_root}: {resolved}"
                 )
+        elif split == "holdout":
+            reserved_development_roots = (
+                development_output_root(target, BUILTIN_SPOTLIGHTING),
+                development_output_root(target, MY_SPOTLIGHTING),
+            )
+            if any(
+                _is_relative_to(resolved, development_root)
+                for development_root in reserved_development_roots
+            ):
+                raise BaselinePreflightError(
+                    "holdout output cannot enter a reserved development directory: "
+                    f"{resolved}"
+                )
         return
     if target == GEMMA4_TARGET:
         if not _is_relative_to(resolved, GEMMA4_BASELINE_ROOT):
@@ -1440,6 +1458,37 @@ def select_cases(
     )
 
 
+def validate_phase9_development_protocol(
+    args: argparse.Namespace,
+    target: BaselineTarget,
+) -> None:
+    """Bind Phase 9 development calls to the frozen Gemma v1 manifest."""
+
+    is_phase9_development = (
+        args.defense == BUILTIN_SPOTLIGHTING
+        or (args.defense == MY_SPOTLIGHTING and args.split == "dev")
+    )
+    if not is_phase9_development:
+        return
+    if target != GEMMA4_TARGET:
+        raise SystemExit("Phase 9 defense development requires --target gemma4-26b")
+    if args.split != "dev":
+        raise SystemExit("Phase 9 defense development requires --split dev")
+    if args.case_plan is None:
+        raise SystemExit(
+            "Phase 9 defense development requires the committed --case-plan "
+            f"{PHASE9_DEV_MANIFEST_PATH.relative_to(PROJECT_ROOT).as_posix()}"
+        )
+    if args.case_plan.resolve() != PHASE9_DEV_MANIFEST_PATH.resolve():
+        raise SystemExit(
+            "Phase 9 defense development may use only the committed v1 development manifest"
+        )
+    if args.expected_plan_sha256 != PHASE9_DEV_PLAN_SHA256:
+        raise SystemExit(
+            "Phase 9 defense development requires the frozen v1 plan SHA-256"
+        )
+
+
 def run_cases(
     args: argparse.Namespace,
     cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
@@ -1609,12 +1658,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.defense != "none" and not args.plan and args.expected_plan_sha256 is None:
         raise SystemExit("defended API execution requires --expected-plan-sha256")
     target = BASELINE_TARGETS[args.target]
-    if args.defense == BUILTIN_SPOTLIGHTING and (
-        target != GEMMA4_TARGET or (not args.plan and args.split != "dev")
-    ):
-        raise SystemExit(
-            "spotlighting_with_delimiting is restricted to the Gemma development validation run"
-        )
+    validate_phase9_development_protocol(args, target)
     payloads = load_corpus()
     cases = select_cases(args, payloads, target)
     selected_plan_sha256 = verify_expected_plan_sha256(

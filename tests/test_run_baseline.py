@@ -135,9 +135,7 @@ class RunBaselineTests(unittest.TestCase):
         )
 
     def test_committed_case_plan_is_the_only_case_source(self) -> None:
-        manifest = (
-            run_baseline.DEFENDED_ROOT / "g4" / "v1" / "dev_manifest.tsv"
-        )
+        manifest = run_baseline.PHASE9_DEV_MANIFEST_PATH
         expected_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
         args = run_baseline.parse_args(
             [
@@ -176,9 +174,7 @@ class RunBaselineTests(unittest.TestCase):
             )
 
     def test_case_plan_rejects_changed_committed_bytes(self) -> None:
-        manifest = (
-            run_baseline.DEFENDED_ROOT / "g4" / "v1" / "dev_manifest.tsv"
-        )
+        manifest = run_baseline.PHASE9_DEV_MANIFEST_PATH
         payloads = run_baseline.load_corpus()
         with tempfile.TemporaryDirectory() as temporary_directory:
             changed = Path(temporary_directory) / "changed.tsv"
@@ -206,6 +202,82 @@ class RunBaselineTests(unittest.TestCase):
         self.assertEqual(run_baseline.MY_SPOTLIGHTING_VERSION, custom_version)
         self.assertRegex(custom_hash, r"^[0-9a-f]{64}$")
         self.assertNotEqual(builtin_hash, custom_hash)
+
+    def test_phase9_builtin_requires_exact_committed_manifest(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "committed --case-plan"):
+            run_baseline.main(
+                [
+                    "--target",
+                    "gemma4-26b",
+                    "--defense",
+                    run_baseline.BUILTIN_SPOTLIGHTING,
+                    "--split",
+                    "dev",
+                    "--expected-plan-sha256",
+                    hashlib.sha256(
+                        run_baseline.PHASE6_PLAN_PATH.read_bytes()
+                    ).hexdigest(),
+                    "--plan",
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            copied_manifest = Path(temporary_directory) / "dev_manifest.tsv"
+            copied_manifest.write_bytes(
+                run_baseline.PHASE9_DEV_MANIFEST_PATH.read_bytes()
+            )
+            with self.assertRaisesRegex(SystemExit, "only the committed"):
+                run_baseline.main(
+                    [
+                        "--target",
+                        "gemma4-26b",
+                        "--defense",
+                        run_baseline.BUILTIN_SPOTLIGHTING,
+                        "--split",
+                        "dev",
+                        "--case-plan",
+                        str(copied_manifest),
+                        "--expected-plan-sha256",
+                        run_baseline.PHASE9_DEV_PLAN_SHA256,
+                        "--plan",
+                    ]
+                )
+
+    def test_phase9_custom_development_rejects_wrong_model(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires --target gemma4-26b"):
+            run_baseline.main(
+                [
+                    "--target",
+                    "gemini",
+                    "--defense",
+                    run_baseline.MY_SPOTLIGHTING,
+                    "--split",
+                    "dev",
+                    "--case-plan",
+                    str(run_baseline.PHASE9_DEV_MANIFEST_PATH),
+                    "--expected-plan-sha256",
+                    run_baseline.PHASE9_DEV_PLAN_SHA256,
+                    "--plan",
+                ]
+            )
+
+    def test_phase9_development_rejects_wrong_frozen_hash(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "frozen v1 plan SHA-256"):
+            run_baseline.main(
+                [
+                    "--target",
+                    "gemma4-26b",
+                    "--defense",
+                    run_baseline.MY_SPOTLIGHTING,
+                    "--split",
+                    "dev",
+                    "--case-plan",
+                    str(run_baseline.PHASE9_DEV_MANIFEST_PATH),
+                    "--expected-plan-sha256",
+                    "0" * 64,
+                    "--plan",
+                ]
+            )
 
     def test_custom_defense_uses_isolated_model_specific_paths(self) -> None:
         gemini = run_baseline.target_results_path(
@@ -297,6 +369,22 @@ class RunBaselineTests(unittest.TestCase):
                 run_baseline.BUILTIN_SPOTLIGHTING,
                 "dev",
             )
+        with self.assertRaisesRegex(
+            run_baseline.BaselinePreflightError,
+            "holdout output cannot enter",
+        ):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                custom,
+                run_baseline.MY_SPOTLIGHTING,
+                "holdout",
+            )
+        run_baseline.validate_output_isolation(
+            run_baseline.GEMMA4_TARGET,
+            run_baseline.DEFENDED_ROOT / "g4" / "v1" / "full" / "results.jsonl",
+            run_baseline.MY_SPOTLIGHTING,
+            "holdout",
+        )
 
     def test_defended_execution_requires_an_explicit_split(self) -> None:
         with self.assertRaisesRegex(SystemExit, "requires --split"):
