@@ -61,6 +61,11 @@ from agentdojo.scripts.benchmark import benchmark_suite
 from agentdojo.task_suite.load_suites import get_suite
 from google.genai.errors import ClientError
 
+from src.defenses.builtin_spotlighting import (
+    DEFENSE_NAME as BUILTIN_SPOTLIGHTING,
+    defense_source_sha256 as builtin_defense_source_sha256,
+    defense_version as builtin_defense_version,
+)
 from src.defenses.my_spotlighting import (
     DEFENSE_NAME as MY_SPOTLIGHTING,
     DEFENSE_VERSION as MY_SPOTLIGHTING_VERSION,
@@ -102,10 +107,18 @@ RAW_ROOT = GEMINI_BASELINE_ROOT / "raw"
 BENCHMARK_VERSION = "v1.2.2"
 WINDOWS_MAX_PATH = 260
 WINDOWS_PATH_SAFETY_MARGIN = 20
-DEFENSE_MODES = ("none", MY_SPOTLIGHTING)
+DEFENSE_MODES = ("none", BUILTIN_SPOTLIGHTING, MY_SPOTLIGHTING)
 MAX_RETRYABLE_CASE_RETRIES = 3
 RETRY_QUEUE_FILENAME = "retry_queue.json"
 RETRYABLE_CASES_PENDING_EXIT_CODE = 3
+PLAN_FIELDS = (
+    "payload_id",
+    "domain",
+    "channel",
+    "injection_vector",
+    "user_task_id",
+    "injection_task_id",
+)
 
 
 @dataclass(frozen=True)
@@ -825,33 +838,72 @@ def verify_expected_plan_sha256(
     return actual_sha256
 
 
+def verify_case_plan_file_sha256(
+    path: Path,
+    cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
+    expected_sha256: str,
+) -> str:
+    """Bind a loaded plan to its exact committed bytes and canonical rows."""
+
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise BaselinePreflightError(
+            "--expected-plan-sha256 must be a lowercase 64-character SHA-256 digest"
+        )
+    file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+    canonical_sha256 = case_plan_sha256(cases)
+    if file_sha256 != canonical_sha256:
+        raise BaselinePreflightError(
+            f"case manifest bytes are not canonical: file={file_sha256}, "
+            f"rows={canonical_sha256}"
+        )
+    if file_sha256 != expected_sha256:
+        raise BaselinePreflightError(
+            "case manifest does not match --expected-plan-sha256: "
+            f"expected={expected_sha256}, actual={file_sha256}"
+        )
+    return file_sha256
+
+
 def load_committed_phase6_plan(
     payloads: Sequence[PayloadEntry],
     path: Path = PHASE6_PLAN_PATH,
 ) -> list[tuple[PayloadEntry, str, str, str, str]]:
     """Load the exact committed 110-case Phase 6 manifest without replanning."""
 
+    cases = load_case_plan(payloads, path)
+    counts = Counter(domain for _, domain, _, _, _ in cases)
+    expected_counts = {"workspace": 52, "banking": 46, "slack": 12}
+    if len(cases) != 110 or dict(counts) != expected_counts:
+        raise BaselinePreflightError(
+            f"{path} is not the committed 110-case Phase 6 manifest: "
+            f"rows={len(cases)}, domains={dict(counts)}"
+        )
+    return cases
+
+
+def load_case_plan(
+    payloads: Sequence[PayloadEntry],
+    path: Path,
+) -> list[tuple[PayloadEntry, str, str, str, str]]:
+    """Load and structurally validate one exact ordered case manifest."""
+
     if not path.is_file():
-        raise BaselinePreflightError(f"missing Phase 6 parity manifest: {path}")
-    expected_fields = (
-        "payload_id",
-        "domain",
-        "channel",
-        "injection_vector",
-        "user_task_id",
-        "injection_task_id",
-    )
+        raise BaselinePreflightError(f"missing case manifest: {path}")
     payload_by_id = {payload.id: payload for payload in payloads}
+    suites: dict[str, Any] = {}
     cases: list[tuple[PayloadEntry, str, str, str, str]] = []
     seen: set[tuple[str, ...]] = set()
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        if tuple(reader.fieldnames or ()) != expected_fields:
+        if tuple(reader.fieldnames or ()) != PLAN_FIELDS:
             raise BaselinePreflightError(
                 f"{path} has unexpected columns: {reader.fieldnames}"
             )
         for line_number, row in enumerate(reader, start=2):
-            if any(not isinstance(row[field], str) or not row[field] for field in expected_fields):
+            if any(
+                not isinstance(row[field], str) or not row[field]
+                for field in PLAN_FIELDS
+            ):
                 raise BaselinePreflightError(f"{path}:{line_number} has an empty field")
             payload = payload_by_id.get(row["payload_id"])
             if payload is None:
@@ -869,12 +921,49 @@ def load_committed_phase6_plan(
                 raise BaselinePreflightError(
                     f"{path}:{line_number} has an incompatible injection vector"
                 )
+            suite = suites.get(domain)
+            if suite is None:
+                try:
+                    suite = get_suite(BENCHMARK_VERSION, domain)
+                except Exception as exc:
+                    raise BaselinePreflightError(
+                        f"{path}:{line_number} references unknown domain {domain!r}"
+                    ) from exc
+                suites[domain] = suite
+            if vector not in suite.get_injection_vector_defaults():
+                raise BaselinePreflightError(
+                    f"{path}:{line_number} references unavailable vector {vector!r}"
+                )
+            user_task_id = row["user_task_id"]
+            injection_task_id = row["injection_task_id"]
+            if user_task_id not in suite.user_tasks:
+                raise BaselinePreflightError(
+                    f"{path}:{line_number} references unknown user task {user_task_id!r}"
+                )
+            if injection_task_id not in suite.injection_tasks:
+                raise BaselinePreflightError(
+                    f"{path}:{line_number} references unknown injection task "
+                    f"{injection_task_id!r}"
+                )
+            probe = _CandidateProbe(suite, None, payload, vector)
+            try:
+                candidates = probe.get_injection_candidates(
+                    suite.user_tasks[user_task_id]
+                )
+            except ValueError as exc:
+                raise BaselinePreflightError(
+                    f"{path}:{line_number} user task does not expose vector {vector!r}"
+                ) from exc
+            if vector not in candidates:
+                raise BaselinePreflightError(
+                    f"{path}:{line_number} user task does not expose vector {vector!r}"
+                )
             key = _case_key(
                 payload.id,
                 domain,
                 vector,
-                row["user_task_id"],
-                row["injection_task_id"],
+                user_task_id,
+                injection_task_id,
             )
             if key in seen:
                 raise BaselinePreflightError(f"{path}:{line_number} duplicates case {key}")
@@ -884,17 +973,12 @@ def load_committed_phase6_plan(
                     payload,
                     domain,
                     vector,
-                    row["user_task_id"],
-                    row["injection_task_id"],
+                    user_task_id,
+                    injection_task_id,
                 )
             )
-    counts = Counter(domain for _, domain, _, _, _ in cases)
-    expected_counts = {"workspace": 52, "banking": 46, "slack": 12}
-    if len(cases) != 110 or dict(counts) != expected_counts:
-        raise BaselinePreflightError(
-            f"{path} is not the committed 110-case Phase 6 manifest: "
-            f"rows={len(cases)}, domains={dict(counts)}"
-        )
+    if not cases:
+        raise BaselinePreflightError(f"{path} contains no cases")
     return cases
 
 
@@ -919,11 +1003,48 @@ def get_target_llm(target: BaselineTarget) -> Any:
     raise BaselinePreflightError(f"unsupported baseline target: {target.cli_name}")
 
 
+def is_defended_mode(defense: str) -> bool:
+    """Return whether a configured mode carries defended-run provenance."""
+
+    return defense in {BUILTIN_SPOTLIGHTING, MY_SPOTLIGHTING}
+
+
+def defense_provenance(defense: str) -> tuple[str, str]:
+    """Return the immutable version and source hash for one defense mode."""
+
+    if defense == BUILTIN_SPOTLIGHTING:
+        return builtin_defense_version(), builtin_defense_source_sha256()
+    if defense == MY_SPOTLIGHTING:
+        return MY_SPOTLIGHTING_VERSION, defense_source_sha256()
+    raise BaselinePreflightError(f"unsupported defended mode: {defense!r}")
+
+
+def pipeline_name_for_defense(target: BaselineTarget, defense: str) -> str:
+    """Return AgentDojo's deterministic raw-trace pipeline component."""
+
+    if defense == BUILTIN_SPOTLIGHTING:
+        return f"{target.pipeline_name}-{BUILTIN_SPOTLIGHTING}"
+    return target.pipeline_name
+
+
+def development_output_root(target: BaselineTarget, defense: str) -> Path:
+    """Return the Phase 9 development directory for one defense."""
+
+    if defense == BUILTIN_SPOTLIGHTING:
+        component = "builtin_dev"
+    elif defense == MY_SPOTLIGHTING:
+        component = "custom_dev"
+    else:
+        raise BaselinePreflightError(f"unsupported defended mode: {defense!r}")
+    return defended_target_root(target) / component
+
+
 def target_results_path(
     target: BaselineTarget,
     matrix: str,
     requested: Path | None,
     defense: str = "none",
+    split: str | None = None,
 ) -> Path:
     if requested is not None:
         return requested.resolve()
@@ -933,6 +1054,8 @@ def target_results_path(
             if matrix == "stratified"
             else target.output_root / "full"
         )
+    elif split == "dev":
+        matrix_root = development_output_root(target, defense)
     else:
         matrix_root = defended_target_root(target)
         if matrix == "full":
@@ -945,6 +1068,7 @@ def target_raw_root(
     matrix: str,
     defense: str = "none",
     requested_results: Path | None = None,
+    split: str | None = None,
 ) -> Path:
     if defense == "none":
         matrix_root = (
@@ -954,6 +1078,8 @@ def target_raw_root(
         )
     elif requested_results is not None:
         matrix_root = requested_results.resolve().parent
+    elif split == "dev":
+        matrix_root = development_output_root(target, defense)
     else:
         matrix_root = defended_target_root(target)
         if matrix == "full":
@@ -984,6 +1110,7 @@ def validate_output_isolation(
     target: BaselineTarget,
     results_path: Path,
     defense: str = "none",
+    split: str | None = None,
 ) -> None:
     """Prevent Gemini, calibrated, and Gemma rows from sharing a dataset."""
 
@@ -995,6 +1122,13 @@ def validate_output_isolation(
                 f"{target.model_name} defended output must remain below "
                 f"{expected_root}: {resolved}"
             )
+        if split == "dev":
+            expected_development_root = development_output_root(target, defense)
+            if not _is_relative_to(resolved, expected_development_root):
+                raise BaselinePreflightError(
+                    f"{defense} development output must remain below "
+                    f"{expected_development_root}: {resolved}"
+                )
         return
     if target == GEMMA4_TARGET:
         if not _is_relative_to(resolved, GEMMA4_BASELINE_ROOT):
@@ -1019,11 +1153,12 @@ def expected_agentdojo_trace_path(
     *,
     target: BaselineTarget,
     raw_root: Path,
+    defense: str = "none",
 ) -> Path:
     payload, domain, vector, user_task_id, injection_task_id = case
     return agentdojo_raw_trace_path(
         raw_root / domain,
-        pipeline_name=target.pipeline_name,
+        pipeline_name=pipeline_name_for_defense(target, defense),
         suite_name=domain,
         user_task_id=user_task_id,
         attack_name=_attack_name(payload.id, vector),
@@ -1036,6 +1171,7 @@ def preflight_trace_paths(
     *,
     target: BaselineTarget,
     raw_root: Path,
+    defense: str = "none",
 ) -> int:
     """Validate every deterministic raw path before quota reservation/API use."""
 
@@ -1043,7 +1179,9 @@ def preflight_trace_paths(
         raise BaselinePreflightError("baseline plan cannot be empty")
     longest = max(
         (
-            expected_agentdojo_trace_path(case, target=target, raw_root=raw_root)
+            expected_agentdojo_trace_path(
+                case, target=target, raw_root=raw_root, defense=defense
+            )
             for case in cases
         ),
         key=lambda path: len(str(path.resolve())),
@@ -1074,21 +1212,32 @@ def execute_case(
     defense_sha256: str | None = None,
 ) -> RunResult:
     """Run one AgentDojo task attempt and append its validated JSONL record."""
-    is_defended = defense == MY_SPOTLIGHTING
+    is_defended = is_defended_mode(defense)
+    current_defense_version: str | None = None
     if is_defended:
         if split not in {"dev", "holdout"}:
             raise BaselinePreflightError(
-                "my_spotlighting execution requires split='dev' or split='holdout'"
+                "defended execution requires split='dev' or split='holdout'"
+            )
+        if defense == BUILTIN_SPOTLIGHTING and split != "dev":
+            raise BaselinePreflightError(
+                "spotlighting_with_delimiting is restricted to split='dev'"
             )
         if plan_sha256 is None or re.fullmatch(r"[0-9a-f]{64}", plan_sha256) is None:
             raise BaselinePreflightError(
-                "my_spotlighting execution requires the ordered plan SHA-256"
+                "defended execution requires the ordered plan SHA-256"
             )
+        current_defense_version, current_defense_sha256 = defense_provenance(defense)
         if defense_sha256 is None:
-            defense_sha256 = defense_source_sha256()
+            defense_sha256 = current_defense_sha256
         if re.fullmatch(r"[0-9a-f]{64}", defense_sha256) is None:
             raise BaselinePreflightError(
-                "my_spotlighting execution requires a valid defense SHA-256"
+                "defended execution requires a valid defense SHA-256"
+            )
+        if defense_sha256 != current_defense_sha256:
+            raise BaselinePreflightError(
+                f"{defense} source hash changed before execution: "
+                f"expected={current_defense_sha256}, received={defense_sha256}"
             )
     elif defense != "none":
         raise BaselinePreflightError(f"unsupported defense mode: {defense!r}")
@@ -1109,8 +1258,11 @@ def execute_case(
     requests_before = get_google_request_attempt_count()
     started_at = time.monotonic()
     target_llm = get_target_llm(target)
-    if is_defended:
+    if defense == MY_SPOTLIGHTING:
         target_llm = MySpotlightingLLM(target_llm)
+    benchmark_kwargs: dict[str, Any] = {}
+    if defense == BUILTIN_SPOTLIGHTING:
+        benchmark_kwargs["defense"] = BUILTIN_SPOTLIGHTING
     results = benchmark_suite(
         suite=suite,
         # AgentDojo's runtime accepts a constructed BasePipelineElement here,
@@ -1122,6 +1274,7 @@ def execute_case(
         user_tasks=(user_task_id,),
         injection_tasks=(injection_task_id,),
         attack=attack_name,
+        **benchmark_kwargs,
     )
     security = results["security_results"][(user_task_id, injection_task_id)]
     raw_path = _raw_trace_path(logdir, user_task_id, attack_name, injection_task_id)
@@ -1168,7 +1321,7 @@ def execute_case(
         attack_set_version="static-corpus-v1" if is_defended else None,
         attack_sha256=attack_sha256,
         plan_sha256=plan_sha256 if is_defended else None,
-        defense_version=MY_SPOTLIGHTING_VERSION if is_defended else None,
+        defense_version=current_defense_version if is_defended else None,
         defense_sha256=defense_sha256 if is_defended else None,
     )
     RunResult.from_dict(record.__dict__, path="generated RunResult")
@@ -1202,6 +1355,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--plan", action="store_true", help="Print planned cases without invoking the API")
     parser.add_argument("--plan-output", type=Path, help="Optional TSV path for a no-API plan manifest")
+    parser.add_argument(
+        "--case-plan",
+        type=Path,
+        help=(
+            "Consume an exact committed TSV as the ordered case source; cannot be "
+            "combined with matrix/domain/payload/injection filters"
+        ),
+    )
     parser.add_argument(
         "--expected-plan-sha256",
         help=(
@@ -1254,6 +1415,8 @@ def select_cases(
 ) -> list[tuple[PayloadEntry, str, str, str, str]]:
     """Select cases while making Gemma parity consume the committed manifest."""
 
+    if args.case_plan is not None:
+        return load_case_plan(payloads, args.case_plan.resolve())
     if target == GEMMA4_TARGET and args.matrix == "stratified":
         cases = load_committed_phase6_plan(payloads)
         domains = set(args.domain) if args.domain else None
@@ -1290,9 +1453,14 @@ def run_cases(
     if args.prune_errored_results:
         removed = prune_errored_results(results_path)
         print(f"Pruned {removed} errored/skipped checkpoint row(s) from {results_path}")
-    is_defended = args.defense == MY_SPOTLIGHTING
+    is_defended = is_defended_mode(args.defense)
     plan_sha256 = case_plan_sha256(cases) if is_defended else None
-    current_defense_sha256 = defense_source_sha256() if is_defended else None
+    current_defense_version: str | None = None
+    current_defense_sha256: str | None = None
+    if is_defended:
+        current_defense_version, current_defense_sha256 = defense_provenance(
+            args.defense
+        )
     completed_kwargs: dict[str, Any] = {
         "expected_model": f"google-{target.model_name}"
     }
@@ -1302,7 +1470,7 @@ def run_cases(
                 "expected_defense": args.defense,
                 "expected_split": args.split,
                 "expected_plan_sha256": plan_sha256,
-                "expected_defense_version": MY_SPOTLIGHTING_VERSION,
+                "expected_defense_version": current_defense_version,
                 "expected_defense_sha256": current_defense_sha256,
                 "expected_attack_sha256_by_case": defended_attack_sha256_by_case(
                     cases
@@ -1422,16 +1590,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--max-runs must be at least 1")
     if args.max_case_retries < 0:
         raise SystemExit("--max-case-retries cannot be negative")
+    if args.case_plan is not None and (
+        args.matrix != "stratified"
+        or args.domain
+        or args.payload_id
+        or args.injection_task
+    ):
+        raise SystemExit(
+            "--case-plan cannot be combined with --matrix full, --domain, "
+            "--payload-id, or --injection-task"
+        )
+    if args.case_plan is not None and args.expected_plan_sha256 is None:
+        raise SystemExit("--case-plan requires --expected-plan-sha256")
     if args.defense == "none" and args.split is not None:
         raise SystemExit("--split is valid only with a defended run")
     if args.defense != "none" and not args.plan and args.split is None:
         raise SystemExit("defended API execution requires --split dev or --split holdout")
+    if args.defense != "none" and not args.plan and args.expected_plan_sha256 is None:
+        raise SystemExit("defended API execution requires --expected-plan-sha256")
     target = BASELINE_TARGETS[args.target]
+    if args.defense == BUILTIN_SPOTLIGHTING and (
+        target != GEMMA4_TARGET or (not args.plan and args.split != "dev")
+    ):
+        raise SystemExit(
+            "spotlighting_with_delimiting is restricted to the Gemma development validation run"
+        )
     payloads = load_corpus()
     cases = select_cases(args, payloads, target)
     selected_plan_sha256 = verify_expected_plan_sha256(
         cases, args.expected_plan_sha256
     )
+    if args.case_plan is not None:
+        selected_plan_sha256 = verify_case_plan_file_sha256(
+            args.case_plan.resolve(), cases, args.expected_plan_sha256
+        )
     if args.plan:
         if args.plan_output:
             write_plan(cases, args.plan_output.resolve())
@@ -1443,13 +1635,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     results_path = target_results_path(
-        target, args.matrix, args.results_path, args.defense
+        target, args.matrix, args.results_path, args.defense, args.split
     )
     raw_root = target_raw_root(
-        target, args.matrix, args.defense, args.results_path
+        target, args.matrix, args.defense, args.results_path, args.split
     )
-    validate_output_isolation(target, results_path, args.defense)
-    longest_path = preflight_trace_paths(cases, target=target, raw_root=raw_root)
+    validate_output_isolation(target, results_path, args.defense, args.split)
+    longest_path = preflight_trace_paths(
+        cases, target=target, raw_root=raw_root, defense=args.defense
+    )
     print(
         f"Baseline preflight: target={target.model_name}, cases={len(cases)}, "
         f"longest_trace_path={longest_path}, windows_margin={WINDOWS_PATH_SAFETY_MARGIN}"
