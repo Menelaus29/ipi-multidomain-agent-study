@@ -345,8 +345,27 @@ def safe_attack_name(prefix: str, *parts: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "_", "_".join((prefix, *parts)))
 
 
-def _attack_name(payload_id: str, injection_vector: str) -> str:
-    """Return a stable registry/file-system-safe name for one attack variant."""
+def _attack_name(
+    payload_id: str,
+    injection_vector: str,
+    *,
+    defense: str = "none",
+) -> str:
+    """Return a stable registry/file-system-safe name for one attack variant.
+
+    AgentDojo includes the pipeline name, task, and attack name in every raw
+    trace path.  The Phase 9 defense pipeline name is already long enough to
+    exceed Windows ``MAX_PATH`` when paired with the corpus/vector name, so
+    defended runs use a compact digest.  The result index still records the
+    payload ID and injection vector, preserving human-readable provenance;
+    undefended and legacy paths retain their original names for compatibility.
+    """
+
+    if defense in {BUILTIN_SPOTLIGHTING, MY_SPOTLIGHTING}:
+        digest = hashlib.sha256(
+            f"{payload_id}\x00{injection_vector}".encode("utf-8")
+        ).hexdigest()[:16]
+        return safe_attack_name("p9", digest)
     return safe_attack_name("corpus", payload_id, injection_vector)
 
 
@@ -355,11 +374,12 @@ def register_vector_payload_attack(
     injection_vector: str,
     *,
     name_prefix: str = "corpus",
+    registered_name: str | None = None,
     missing_vector_error: Callable[[str], Exception] = ValueError,
 ) -> str:
     """Register a payload bound to exactly one AgentDojo injection vector."""
 
-    name = safe_attack_name(name_prefix, payload.id, injection_vector)
+    name = registered_name or safe_attack_name(name_prefix, payload.id, injection_vector)
 
     class RegisteredCorpusPayloadAttack(CorpusPayloadAttack):
         def __init__(self, task_suite: Any, target_pipeline: Any) -> None:
@@ -406,9 +426,18 @@ def register_vector_template_attack(
     )
 
 
-def register_payload_attack(payload: PayloadEntry, injection_vector: str) -> str:
+def register_payload_attack(
+    payload: PayloadEntry,
+    injection_vector: str,
+    *,
+    defense: str = "none",
+) -> str:
     """Register a parameterised AgentDojo attack and return its registry name."""
-    return register_vector_payload_attack(payload, injection_vector)
+    return register_vector_payload_attack(
+        payload,
+        injection_vector,
+        registered_name=_attack_name(payload.id, injection_vector, defense=defense),
+    )
 
 
 def load_corpus(path: Path = CORPUS_PATH) -> list[PayloadEntry]:
@@ -1179,7 +1208,7 @@ def expected_agentdojo_trace_path(
         pipeline_name=pipeline_name_for_defense(target, defense),
         suite_name=domain,
         user_task_id=user_task_id,
-        attack_name=_attack_name(payload.id, vector),
+        attack_name=_attack_name(payload.id, vector, defense=defense),
         injection_task_id=injection_task_id,
     )
 
@@ -1265,7 +1294,11 @@ def execute_case(
         )
 
     suite = get_suite(BENCHMARK_VERSION, domain)
-    attack_name = register_payload_attack(payload, injection_vector)
+    attack_name = register_payload_attack(
+        payload,
+        injection_vector,
+        defense=defense,
+    )
     # AgentDojo's injection-task utility traces use the "none" attack path.
     # Sharing a domain root lets later payload cases reuse those completed
     # native-task checks while their distinct attack names keep raw attack
