@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "study_id": "gemma4-defense-validation-v1",
+  "analysis_role": "development-only implementation validation for built-in and custom spotlighting",
+  "benchmark_version": "v1.2.2",
+  "target_model": "google-gemma-4-26b-a4b-it",
+  "split": "dev",
+  "payload_ids": [
+    "persona-04",
+    "encoding-03",
+    "fake-system-04",
+    "template-02",
+    "template-03"
+  ],
+  "manifest_path": "data/defended/g4/v1/dev_manifest.tsv",
+  "plan_sha256": "df0826f7cb52050f19a8a3d536ee8a6dbcd669ffb8deea49b7f40da2039669ef",
+  "case_key_fields": [
+    "payload_id",
+    "domain",
+    "channel",
+    "injection_vector",
+    "user_task_id",
+    "injection_task_id"
+  ],
+  "case_count": 20,
+  "domain": "workspace",
+  "selection_rule": "Preserve committed Phase 6 plan order; select every Workspace row for the five payload IDs frozen by gemma4-banking-followup-v1.",
+  "selection_basis": "The context filter is structural and independent of attack or defended outcomes; the five-payload set is the already authorized frozen follow-up input.",
+  "source_plan_path": "data/baseline/plan.tsv",
+  "source_plan_sha256": "d000809142e1624c7085cf3d01b5c3c782ca09c64c76f89bb9315c8c0ba6d050",
+  "matching_undefended_results_path": "data/baseline_gemma4/results.jsonl",
+  "excluded_followup_plan_path": "data/baseline_gemma4/banking_followup/plan.tsv",
+  "excluded_followup_plan_sha256": "bc3e39fc087979621b57a2b85401912430fe83fc08c39cab980dcf2862e56b74",
+  "excluded_followup_case_count": 180,
+  "required_disjointness": "No complete six-field case key may occur in the Banking follow-up plan.",
+  "intended_outputs": {
+    "builtin_spotlighting": "data/defended/g4/v1/builtin_dev/",
+    "my_spotlighting": "data/defended/g4/v1/custom_dev/"
+  }
+}
