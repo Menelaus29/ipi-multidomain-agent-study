@@ -1076,11 +1076,11 @@ def execute_case(
             f"api_request_attempts={api_request_attempts}; elapsed_seconds={elapsed_seconds:.3f}; "
             "attack_success equals AgentDojo's injection-task success check"
         ),
-        utility_success=(
-            results["utility_results"][(user_task_id, injection_task_id)]
-            if is_defended
-            else None
-        ),
+        # AgentDojo computes native legitimate-task utility for both defended
+        # and undefended injected runs. Preserve that verdict in every new
+        # index row; legacy baseline artifacts that serialized null remain
+        # valid and immutable.
+        utility_success=results["utility_results"][(user_task_id, injection_task_id)],
         split="holdout" if is_defended else None,
         attack_set_version="static-corpus-v1" if is_defended else None,
         attack_sha256=attack_sha256,

@@ -476,6 +476,77 @@ class RunBaselineTests(unittest.TestCase):
         self.assertEqual("holdout", record.split)
         self.assertTrue(record.utility_success)
 
+    def test_execute_case_records_undefended_native_utility_without_split(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        suite = _FakeSuite("workspace")
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "trace.json"
+            raw_path.write_text(
+                json.dumps(
+                    {"error": None, "messages": [], "utility": False, "security": False}
+                ),
+                encoding="utf-8",
+            )
+            results_path = root / "results.jsonl"
+            with (
+                patch.object(run_baseline, "get_suite", return_value=suite),
+                patch.object(run_baseline, "get_target_llm", return_value=_FakeLLM()),
+                patch.object(run_baseline, "_raw_trace_path", return_value=raw_path),
+                patch.object(run_baseline, "PROJECT_ROOT", root),
+                patch.object(
+                    run_baseline,
+                    "benchmark_suite",
+                    return_value={
+                        "security_results": {
+                            ("user_task_14", "injection_task_0"): False
+                        },
+                        "utility_results": {
+                            ("user_task_14", "injection_task_0"): False
+                        },
+                    },
+                ),
+            ):
+                record = run_baseline.execute_case(
+                    payload,
+                    "workspace",
+                    "email_events_injection",
+                    "user_task_14",
+                    "injection_task_0",
+                    results_path,
+                    target=run_baseline.GEMMA4_TARGET,
+                    raw_root=root,
+                )
+            serialized = json.loads(results_path.read_text(encoding="utf-8"))
+
+        self.assertEqual("none", record.defense)
+        self.assertFalse(record.utility_success)
+        self.assertIsNone(record.split)
+        self.assertIs(serialized["utility_success"], False)
+        self.assertIsNone(serialized["split"])
+
+    def test_run_result_allows_utility_without_split(self) -> None:
+        record = RunResult(
+            run_id="future-undefended",
+            timestamp="2026-08-12T00:00:00+00:00",
+            domain="banking",
+            user_task_id="user_task_0",
+            injection_task_id="injection_task_0",
+            payload_id="persona-04",
+            channel="file_content",
+            model="google-gemma-4-26b-a4b-it",
+            defense="none",
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=injection_bill_text",
+            utility_success=True,
+        )
+
+        parsed = RunResult.from_dict(record.__dict__)
+
+        self.assertTrue(parsed.utility_success)
+        self.assertIsNone(parsed.split)
+
     def test_quota_detection_requires_a_google_429(self) -> None:
         self.assertTrue(run_baseline.is_quota_exhausted(Exception("429 RESOURCE_EXHAUSTED: quota exceeded")))
         self.assertTrue(

@@ -267,6 +267,42 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(replication_provenance.primary_denominator_eligible)
         self.assertTrue(combined_provenance.descriptive_only)
 
+    def test_future_indexed_utility_booleans_are_accepted_and_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = SyntheticArtifacts(Path(temporary))
+            records = [
+                json.loads(line)
+                for line in artifacts.results.read_text(encoding="utf-8").splitlines()
+            ]
+            records[0]["utility_success"] = False
+            records[1]["utility_success"] = True
+            artifacts.results.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            combined, _ = artifacts.reconcile("all-descriptive")
+
+        self.assertEqual([False, True], [case.utility_success for case in combined])
+
+    def test_future_indexed_utility_mismatch_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = SyntheticArtifacts(Path(temporary))
+            records = [
+                json.loads(line)
+                for line in artifacts.results.read_text(encoding="utf-8").splitlines()
+            ]
+            records[1]["utility_success"] = False
+            artifacts.results.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                aggregate_results.AggregationError, "utility disagrees"
+            ):
+                artifacts.reconcile("fresh")
+
     def test_trace_security_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = SyntheticArtifacts(Path(temporary))
@@ -833,9 +869,13 @@ class CommittedArtifactRegressionTests(unittest.TestCase):
                     aggregate_results.summarize_cases(cases, provenance),
                     fieldnames=aggregate_results.SUMMARY_FIELDS,
                 )
+                # Git may materialize committed text artifacts with CRLF on
+                # Windows even though the deterministic writer emits LF.
+                # Compare canonical content here; frozen working-tree bytes
+                # are guarded separately by test_frozen_baseline_artifacts.
                 self.assertEqual(
-                    committed.read_bytes(),
-                    generated.read_bytes(),
+                    committed.read_bytes().replace(b"\r\n", b"\n"),
+                    generated.read_bytes().replace(b"\r\n", b"\n"),
                     msg=f"committed summary differs for {partition}",
                 )
 
