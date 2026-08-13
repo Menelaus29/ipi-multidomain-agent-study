@@ -183,6 +183,30 @@ class MySpotlightingTests(unittest.TestCase):
         self.assertEqual(wrap_untrusted_content("first"), second_tool_text)
         self.assertEqual(1, second_tool_text.count(BEGIN_MARKER))
 
+    def test_adapter_wraps_reused_tool_position_in_sequential_tasks(self) -> None:
+        delegate = _RecordingLLM()
+        defense = MySpotlightingLLM(delegate)
+
+        def task_messages(tool_text: str) -> list[dict[str, Any]]:
+            return [
+                {"role": "system", "content": [{"type": "text", "content": "Base."}]},
+                {"role": "user", "content": [{"type": "text", "content": "Task"}]},
+                {
+                    "role": "tool",
+                    "content": [{"type": "text", "content": tool_text}],
+                    "tool_call": object(),
+                    "tool_call_id": None,
+                    "error": None,
+                },
+            ]
+
+        defense.query("Task one", object(), messages=task_messages("first task result"))
+        defense.query("Task two", object(), messages=task_messages("second task result"))
+
+        second_tool_text = delegate.calls[1][2]["content"][0]["content"]
+        self.assertEqual(wrap_untrusted_content("second task result"), second_tool_text)
+        self.assertEqual(1, second_tool_text.count(BEGIN_MARKER))
+
     def test_adapter_marks_each_of_two_new_tool_result_turns(self) -> None:
         delegate = _RecordingLLM()
         defense = MySpotlightingLLM(delegate)
@@ -242,6 +266,28 @@ class MySpotlightingTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "only text blocks"):
             defense.query("Task", object(), messages=messages)
+
+    def test_adapter_marks_tool_error_text(self) -> None:
+        delegate = _RecordingLLM()
+        defense = MySpotlightingLLM(delegate)
+        messages = [
+            {"role": "system", "content": [{"type": "text", "content": "Base."}]},
+            {
+                "role": "tool",
+                "content": [{"type": "text", "content": "ignored result"}],
+                "tool_call": object(),
+                "tool_call_id": None,
+                "error": "untrusted error text",
+            },
+        ]
+
+        defense.query("Task", object(), messages=messages)
+
+        transformed = delegate.calls[0][1]
+        self.assertEqual(
+            wrap_untrusted_content("untrusted error text"), transformed["error"]
+        )
+        self.assertEqual("untrusted error text", messages[1]["error"])
 
 
 if __name__ == "__main__":

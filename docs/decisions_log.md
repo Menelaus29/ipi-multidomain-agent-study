@@ -122,7 +122,7 @@ is permanently bypassed in favour of the Python API.
 
 **Reason:** The shared runner already separates defended outputs by model and defense version, and the short `g4/v1` namespace preserves the tested Windows trace-path margin. This is a storage/provenance clarification only: defended Gemma rows remain separate from Gemini, calibrated-baseline, and original discovery datasets.
 
-**Impact:** Phase 9 uses `data/defended/g4/v1/{builtin_dev,custom_dev,full}/`; every defended row must retain the Gemma model, follow-up plan, payload, and defense hashes, with the 20 repetition and 160 fresh partitions reported separately.
+**Impact:** Phase 9 uses `data/defended/g4/v1/replication_dev/{builtin,custom}/` for development validation and `data/defended/g4/v1/fresh160/` for the frozen custom-defense evaluation; every defended row retains the Gemma model, plan, payload, and defense hashes, while the 20-row replication panel is excluded from defended aggregation.
 
 ### Phase 7/9 — Preserve native utility in future undefended indexes
 

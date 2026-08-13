@@ -142,8 +142,36 @@ def _mark_tool_message(message: ChatMessage) -> ChatMessage:
             raise TypeError("tool text content must be a string")
         updated_block["content"] = wrap_untrusted_content(text)
         content.append(updated_block)
+    error = updated.get("error")
+    if error is not None:
+        if not isinstance(error, str):
+            raise TypeError("tool error content must be a string or null")
+        # AgentDojo's Google serializer sends ``error`` instead of ``content``
+        # for failed tool calls. Mark it at the same trust boundary so an error
+        # string cannot bypass the policy applied to successful tool results.
+        updated["error"] = wrap_untrusted_content(error)
     updated["content"] = content
     return updated  # type: ignore[return-value]
+
+
+def _tool_message_signature(message: ChatMessage) -> tuple[tuple[str, ...], str | None]:
+    """Return the content state used to recognize an already marked message."""
+
+    message_content = message.get("content")
+    if not isinstance(message_content, list):
+        raise TypeError("tool messages must contain a list of content blocks")
+    text_blocks: list[str] = []
+    for block in message_content:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            raise TypeError("tool messages may contain only text blocks")
+        text = block.get("content")
+        if not isinstance(text, str):
+            raise TypeError("tool text content must be a string")
+        text_blocks.append(text)
+    error = message.get("error")
+    if error is not None and not isinstance(error, str):
+        raise TypeError("tool error content must be a string or null")
+    return tuple(text_blocks), error
 
 
 class MySpotlightingLLM(BasePipelineElement):
@@ -152,8 +180,9 @@ class MySpotlightingLLM(BasePipelineElement):
     AgentDojo's installed pipeline API exposes only its built-in defense names.
     This adapter keeps the established ``benchmark_suite`` path intact while
     transforming the messages delivered to the selected target LLM. Message
-    positions are stable in AgentDojo's append-only tool loop, so position
-    tracking prevents old tool results from being wrapped again on later turns.
+    positions are stable within one AgentDojo task. The adapter records the
+    exact transformed content at each position so old history is not wrapped
+    again, while a fresh task reusing the same position is still marked.
     """
 
     def __init__(self, delegate: BasePipelineElement) -> None:
@@ -163,7 +192,9 @@ class MySpotlightingLLM(BasePipelineElement):
         # Keep AgentDojo's canonical model/pipeline name so attack construction,
         # deterministic raw-trace paths, and model attribution remain unchanged.
         self.name = delegate.name
-        self._marked_tool_positions: set[int] = set()
+        self._marked_tool_messages: dict[
+            int, tuple[tuple[str, ...], str | None]
+        ] = {}
 
     def query(
         self,
@@ -173,19 +204,19 @@ class MySpotlightingLLM(BasePipelineElement):
         messages: Sequence[ChatMessage] = (),
         extra_args: dict = {},
     ) -> tuple[str, FunctionsRuntime, Env, Sequence[ChatMessage], dict]:
-        if len(messages) <= 2 and self._marked_tool_positions:
-            self._marked_tool_positions.clear()
-
         transformed = list(messages)
-        newly_marked_positions: set[int] = set()
         for index, message in enumerate(messages):
             role = message.get("role")
             if role == "system":
                 transformed[index] = _append_system_policy(message)
-            elif role == "tool" and index not in self._marked_tool_positions:
-                transformed[index] = _mark_tool_message(message)
-                newly_marked_positions.add(index)
+            elif role == "tool":
+                current_signature = _tool_message_signature(message)
+                if self._marked_tool_messages.get(index) != current_signature:
+                    marked_message = _mark_tool_message(message)
+                    transformed[index] = marked_message
+                    self._marked_tool_messages[index] = _tool_message_signature(
+                        marked_message
+                    )
 
         result = self.delegate.query(query, runtime, env, transformed, extra_args)
-        self._marked_tool_positions.update(newly_marked_positions)
         return result

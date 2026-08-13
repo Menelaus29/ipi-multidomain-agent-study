@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import tempfile
@@ -126,6 +127,157 @@ class RunBaselineTests(unittest.TestCase):
                 ["--plan", "--defense", run_baseline.MY_SPOTLIGHTING]
             ).defense,
         )
+        self.assertEqual(
+            run_baseline.BUILTIN_SPOTLIGHTING,
+            run_baseline.parse_args(
+                ["--plan", "--defense", run_baseline.BUILTIN_SPOTLIGHTING]
+            ).defense,
+        )
+
+    def test_committed_case_plan_is_the_only_case_source(self) -> None:
+        manifest = run_baseline.PHASE9_DEV_MANIFEST_PATH
+        expected_hash = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        args = run_baseline.parse_args(
+            [
+                "--target",
+                "gemma4-26b",
+                "--plan",
+                "--case-plan",
+                str(manifest),
+                "--expected-plan-sha256",
+                expected_hash,
+            ]
+        )
+
+        cases = run_baseline.select_cases(
+            args, run_baseline.load_corpus(), run_baseline.GEMMA4_TARGET
+        )
+
+        self.assertEqual(20, len(cases))
+        self.assertEqual(
+            expected_hash,
+            run_baseline.verify_case_plan_file_sha256(
+                manifest, cases, expected_hash
+            ),
+        )
+        with self.assertRaisesRegex(SystemExit, "cannot be combined"):
+            run_baseline.main(
+                [
+                    "--plan",
+                    "--case-plan",
+                    str(manifest),
+                    "--expected-plan-sha256",
+                    expected_hash,
+                    "--domain",
+                    "workspace",
+                ]
+            )
+
+    def test_case_plan_rejects_changed_committed_bytes(self) -> None:
+        manifest = run_baseline.PHASE9_DEV_MANIFEST_PATH
+        payloads = run_baseline.load_corpus()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            changed = Path(temporary_directory) / "changed.tsv"
+            changed.write_bytes(
+                manifest.read_bytes().replace(b"persona-04", b"template-03", 1)
+            )
+            with self.assertRaises(run_baseline.BaselinePreflightError):
+                cases = run_baseline.load_case_plan(payloads, changed)
+                run_baseline.verify_case_plan_file_sha256(
+                    changed,
+                    cases,
+                    hashlib.sha256(manifest.read_bytes()).hexdigest(),
+                )
+
+    def test_defense_provenance_is_mode_specific_and_stable(self) -> None:
+        builtin_version, builtin_hash = run_baseline.defense_provenance(
+            run_baseline.BUILTIN_SPOTLIGHTING
+        )
+        custom_version, custom_hash = run_baseline.defense_provenance(
+            run_baseline.MY_SPOTLIGHTING
+        )
+
+        self.assertEqual("agentdojo-0.1.35", builtin_version)
+        self.assertRegex(builtin_hash, r"^[0-9a-f]{64}$")
+        self.assertEqual(run_baseline.MY_SPOTLIGHTING_VERSION, custom_version)
+        self.assertRegex(custom_hash, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(builtin_hash, custom_hash)
+
+    def test_phase9_builtin_requires_exact_committed_manifest(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "committed --case-plan"):
+            run_baseline.main(
+                [
+                    "--target",
+                    "gemma4-26b",
+                    "--defense",
+                    run_baseline.BUILTIN_SPOTLIGHTING,
+                    "--split",
+                    "dev",
+                    "--expected-plan-sha256",
+                    hashlib.sha256(
+                        run_baseline.PHASE6_PLAN_PATH.read_bytes()
+                    ).hexdigest(),
+                    "--plan",
+                ]
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            copied_manifest = Path(temporary_directory) / "dev_manifest.tsv"
+            copied_manifest.write_bytes(
+                run_baseline.PHASE9_DEV_MANIFEST_PATH.read_bytes()
+            )
+            with self.assertRaisesRegex(SystemExit, "only the committed"):
+                run_baseline.main(
+                    [
+                        "--target",
+                        "gemma4-26b",
+                        "--defense",
+                        run_baseline.BUILTIN_SPOTLIGHTING,
+                        "--split",
+                        "dev",
+                        "--case-plan",
+                        str(copied_manifest),
+                        "--expected-plan-sha256",
+                        run_baseline.PHASE9_DEV_PLAN_SHA256,
+                        "--plan",
+                    ]
+                )
+
+    def test_phase9_custom_development_rejects_wrong_model(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires --target gemma4-26b"):
+            run_baseline.main(
+                [
+                    "--target",
+                    "gemini",
+                    "--defense",
+                    run_baseline.MY_SPOTLIGHTING,
+                    "--split",
+                    "dev",
+                    "--case-plan",
+                    str(run_baseline.PHASE9_DEV_MANIFEST_PATH),
+                    "--expected-plan-sha256",
+                    run_baseline.PHASE9_DEV_PLAN_SHA256,
+                    "--plan",
+                ]
+            )
+
+    def test_phase9_development_rejects_wrong_frozen_hash(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "frozen v1 plan SHA-256"):
+            run_baseline.main(
+                [
+                    "--target",
+                    "gemma4-26b",
+                    "--defense",
+                    run_baseline.MY_SPOTLIGHTING,
+                    "--split",
+                    "dev",
+                    "--case-plan",
+                    str(run_baseline.PHASE9_DEV_MANIFEST_PATH),
+                    "--expected-plan-sha256",
+                    "0" * 64,
+                    "--plan",
+                ]
+            )
 
     def test_custom_defense_uses_isolated_model_specific_paths(self) -> None:
         gemini = run_baseline.target_results_path(
@@ -153,6 +305,157 @@ class RunBaselineTests(unittest.TestCase):
                 run_baseline.GEMMA4_BASELINE_ROOT / "results.jsonl",
                 run_baseline.MY_SPOTLIGHTING,
             )
+        with self.assertRaises(run_baseline.BaselinePreflightError):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                run_baseline.DEFENDED_ROOT / "g35" / "v1" / "results.jsonl",
+                run_baseline.MY_SPOTLIGHTING,
+            )
+
+    def test_custom_defense_places_raw_traces_beside_requested_index(self) -> None:
+        requested = (
+            run_baseline.DEFENDED_ROOT
+            / "g4"
+            / "v1"
+            / "replication_dev"
+            / "custom"
+            / "results.jsonl"
+        )
+
+        raw_root = run_baseline.target_raw_root(
+            run_baseline.GEMMA4_TARGET,
+            "full",
+            run_baseline.MY_SPOTLIGHTING,
+            requested,
+        )
+
+        self.assertEqual(requested.parent / "r", raw_root)
+
+    def test_development_defenses_default_to_distinct_output_roots(self) -> None:
+        builtin = run_baseline.target_results_path(
+            run_baseline.GEMMA4_TARGET,
+            "stratified",
+            None,
+            run_baseline.BUILTIN_SPOTLIGHTING,
+            "dev",
+        )
+        custom = run_baseline.target_results_path(
+            run_baseline.GEMMA4_TARGET,
+            "stratified",
+            None,
+            run_baseline.MY_SPOTLIGHTING,
+            "dev",
+        )
+
+        self.assertEqual(
+            run_baseline.DEFENDED_ROOT
+            / "g4"
+            / "v1"
+            / "replication_dev"
+            / "builtin"
+            / "results.jsonl",
+            builtin,
+        )
+        self.assertEqual(
+            run_baseline.DEFENDED_ROOT
+            / "g4"
+            / "v1"
+            / "replication_dev"
+            / "custom"
+            / "results.jsonl",
+            custom,
+        )
+        with self.assertRaises(run_baseline.BaselinePreflightError):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                custom,
+                run_baseline.BUILTIN_SPOTLIGHTING,
+                "dev",
+            )
+        with self.assertRaisesRegex(
+            run_baseline.BaselinePreflightError,
+            "holdout output cannot enter",
+        ):
+            run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                custom,
+                run_baseline.MY_SPOTLIGHTING,
+                "holdout",
+            )
+        run_baseline.validate_output_isolation(
+                run_baseline.GEMMA4_TARGET,
+                run_baseline.DEFENDED_ROOT / "g4" / "v1" / "fresh160" / "results.jsonl",
+                run_baseline.MY_SPOTLIGHTING,
+                "holdout",
+        )
+
+    def test_defended_execution_requires_an_explicit_split(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "requires --split"):
+            run_baseline.main(
+                ["--target", "gemma4-26b", "--defense", run_baseline.MY_SPOTLIGHTING]
+            )
+
+    def test_phase9_holdout_requires_the_committed_defense_freeze(self) -> None:
+        args = run_baseline.parse_args(
+            [
+                "--target",
+                "gemma4-26b",
+                "--defense",
+                run_baseline.MY_SPOTLIGHTING,
+                "--split",
+                "holdout",
+                "--case-plan",
+                str(run_baseline.PHASE9_FRESH160_PLAN_PATH),
+                "--expected-plan-sha256",
+                run_baseline.PHASE9_FRESH160_PLAN_SHA256,
+                "--plan",
+            ]
+        )
+        target = run_baseline.GEMMA4_TARGET
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            freeze_path = Path(temporary_directory) / "defense_freeze.json"
+            artifact = json.loads(
+                run_baseline.PHASE9_DEFENSE_FREEZE_PATH.read_text(encoding="utf-8")
+            )
+            artifact["source_sha256_canonical_lf"] = "0" * 64
+            freeze_path.write_text(
+                json.dumps(artifact), encoding="utf-8"
+            )
+            with patch.object(
+                run_baseline, "PHASE9_DEFENSE_FREEZE_PATH", freeze_path
+            ), self.assertRaisesRegex(SystemExit, "source hash"):
+                run_baseline.validate_phase9_holdout_protocol(args, target)
+
+    def test_phase9_holdout_freeze_failure_precedes_quota_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            freeze_path = Path(temporary_directory) / "defense_freeze.json"
+            artifact = json.loads(
+                run_baseline.PHASE9_DEFENSE_FREEZE_PATH.read_text(encoding="utf-8")
+            )
+            artifact["system_prompt_fragment"] = "tampered"
+            freeze_path.write_text(json.dumps(artifact), encoding="utf-8")
+            with (
+                patch.object(
+                    run_baseline, "PHASE9_DEFENSE_FREEZE_PATH", freeze_path
+                ),
+                patch.object(run_baseline, "quota_guard_from_args") as quota_guard,
+                self.assertRaisesRegex(SystemExit, "system prompt"),
+            ):
+                run_baseline.main(
+                    [
+                        "--target",
+                        "gemma4-26b",
+                        "--defense",
+                        run_baseline.MY_SPOTLIGHTING,
+                        "--split",
+                        "holdout",
+                        "--case-plan",
+                        str(run_baseline.PHASE9_FRESH160_PLAN_PATH),
+                        "--expected-plan-sha256",
+                        run_baseline.PHASE9_FRESH160_PLAN_SHA256,
+                    ]
+                )
+            quota_guard.assert_not_called()
 
     def test_gemma_output_isolation_rejects_gemini_directories(self) -> None:
         for path in (
@@ -424,6 +727,52 @@ class RunBaselineTests(unittest.TestCase):
                     path, expected_defense=run_baseline.MY_SPOTLIGHTING
                 )
 
+    def test_completed_cases_rejects_stale_defended_provenance(self) -> None:
+        key = (
+            "direct-01",
+            "workspace",
+            "email_events_injection",
+            "user_task_14",
+            "injection_task_0",
+        )
+        record = RunResult(
+            run_id="run-1",
+            timestamp="2026-08-04T00:00:00+00:00",
+            domain="workspace",
+            user_task_id="user_task_14",
+            injection_task_id="injection_task_0",
+            payload_id="direct-01",
+            channel="email_body",
+            model="google-gemma-4-26b-a4b-it",
+            defense=run_baseline.MY_SPOTLIGHTING,
+            attack_success=False,
+            tool_calls=[],
+            notes="injection_vector=email_events_injection",
+            utility_success=True,
+            split="dev",
+            attack_set_version="static-corpus-v1",
+            attack_sha256="b" * 64,
+            plan_sha256="a" * 64,
+            defense_version=run_baseline.MY_SPOTLIGHTING_VERSION,
+            defense_sha256="c" * 64,
+        )
+        expectations = (
+            {"expected_split": "holdout"},
+            {"expected_plan_sha256": "d" * 64},
+            {"expected_defense_version": "v2"},
+            {"expected_defense_sha256": "e" * 64},
+            {"expected_attack_sha256_by_case": {key: "f" * 64}},
+            {"expected_attack_sha256_by_case": {}},
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "results.jsonl"
+            path.write_text(json.dumps(record.__dict__) + "\n", encoding="utf-8")
+            for expected in expectations:
+                with self.subTest(expected=expected), self.assertRaises(
+                    run_baseline.SchemaValidationError
+                ):
+                    run_baseline.completed_cases(path, **expected)
+
     def test_execute_case_wires_custom_adapter_and_provenance_without_network(self) -> None:
         payload = run_baseline.load_corpus()[0]
         suite = _FakeSuite("workspace")
@@ -464,6 +813,7 @@ class RunBaselineTests(unittest.TestCase):
                     results_path,
                     raw_root=root,
                     defense=run_baseline.MY_SPOTLIGHTING,
+                    split="dev",
                     plan_sha256="a" * 64,
                 )
 
@@ -473,7 +823,67 @@ class RunBaselineTests(unittest.TestCase):
         self.assertEqual(run_baseline.MY_SPOTLIGHTING, record.defense)
         self.assertEqual(run_baseline.MY_SPOTLIGHTING_VERSION, record.defense_version)
         self.assertEqual("static-corpus-v1", record.attack_set_version)
-        self.assertEqual("holdout", record.split)
+        self.assertEqual("dev", record.split)
+        self.assertTrue(record.utility_success)
+
+    def test_execute_case_wires_agentdojo_builtin_defense_without_network(self) -> None:
+        payload = run_baseline.load_corpus()[0]
+        suite = _FakeSuite("workspace")
+        suite.injection_tasks["injection_task_0"] = type(
+            "InjectionTask", (), {"GOAL": self.NATIVE_GOAL}
+        )()
+        builtin_version, builtin_hash = run_baseline.defense_provenance(
+            run_baseline.BUILTIN_SPOTLIGHTING
+        )
+        fake_llm = _FakeLLM()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            raw_path = root / "trace.json"
+            raw_path.write_text(
+                json.dumps({"error": None, "messages": []}), encoding="utf-8"
+            )
+            results_path = root / "results.jsonl"
+            with (
+                patch.object(run_baseline, "get_suite", return_value=suite),
+                patch.object(run_baseline, "get_target_llm", return_value=fake_llm),
+                patch.object(run_baseline, "_raw_trace_path", return_value=raw_path),
+                patch.object(run_baseline, "PROJECT_ROOT", root),
+                patch.object(
+                    run_baseline,
+                    "benchmark_suite",
+                    return_value={
+                        "security_results": {
+                            ("user_task_14", "injection_task_0"): False
+                        },
+                        "utility_results": {
+                            ("user_task_14", "injection_task_0"): True
+                        },
+                    },
+                ) as benchmark,
+            ):
+                record = run_baseline.execute_case(
+                    payload,
+                    "workspace",
+                    "email_events_injection",
+                    "user_task_14",
+                    "injection_task_0",
+                    results_path,
+                    raw_root=root,
+                    defense=run_baseline.BUILTIN_SPOTLIGHTING,
+                    split="dev",
+                    plan_sha256="a" * 64,
+                    defense_sha256=builtin_hash,
+                )
+
+        self.assertIs(benchmark.call_args.kwargs["model"], fake_llm)
+        self.assertEqual(
+            run_baseline.BUILTIN_SPOTLIGHTING,
+            benchmark.call_args.kwargs["defense"],
+        )
+        self.assertEqual(run_baseline.BUILTIN_SPOTLIGHTING, record.defense)
+        self.assertEqual(builtin_version, record.defense_version)
+        self.assertEqual(builtin_hash, record.defense_sha256)
+        self.assertEqual("dev", record.split)
         self.assertTrue(record.utility_success)
 
     def test_execute_case_records_undefended_native_utility_without_split(self) -> None:
