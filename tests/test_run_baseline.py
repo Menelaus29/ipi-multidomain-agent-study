@@ -395,6 +395,68 @@ class RunBaselineTests(unittest.TestCase):
                 ["--target", "gemma4-26b", "--defense", run_baseline.MY_SPOTLIGHTING]
             )
 
+    def test_phase9_holdout_requires_the_committed_defense_freeze(self) -> None:
+        args = run_baseline.parse_args(
+            [
+                "--target",
+                "gemma4-26b",
+                "--defense",
+                run_baseline.MY_SPOTLIGHTING,
+                "--split",
+                "holdout",
+                "--case-plan",
+                str(run_baseline.PHASE9_FRESH160_PLAN_PATH),
+                "--expected-plan-sha256",
+                run_baseline.PHASE9_FRESH160_PLAN_SHA256,
+                "--plan",
+            ]
+        )
+        target = run_baseline.GEMMA4_TARGET
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            freeze_path = Path(temporary_directory) / "defense_freeze.json"
+            artifact = json.loads(
+                run_baseline.PHASE9_DEFENSE_FREEZE_PATH.read_text(encoding="utf-8")
+            )
+            artifact["source_sha256_canonical_lf"] = "0" * 64
+            freeze_path.write_text(
+                json.dumps(artifact), encoding="utf-8"
+            )
+            with patch.object(
+                run_baseline, "PHASE9_DEFENSE_FREEZE_PATH", freeze_path
+            ), self.assertRaisesRegex(SystemExit, "source hash"):
+                run_baseline.validate_phase9_holdout_protocol(args, target)
+
+    def test_phase9_holdout_freeze_failure_precedes_quota_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            freeze_path = Path(temporary_directory) / "defense_freeze.json"
+            artifact = json.loads(
+                run_baseline.PHASE9_DEFENSE_FREEZE_PATH.read_text(encoding="utf-8")
+            )
+            artifact["system_prompt_fragment"] = "tampered"
+            freeze_path.write_text(json.dumps(artifact), encoding="utf-8")
+            with (
+                patch.object(
+                    run_baseline, "PHASE9_DEFENSE_FREEZE_PATH", freeze_path
+                ),
+                patch.object(run_baseline, "quota_guard_from_args") as quota_guard,
+                self.assertRaisesRegex(SystemExit, "system prompt"),
+            ):
+                run_baseline.main(
+                    [
+                        "--target",
+                        "gemma4-26b",
+                        "--defense",
+                        run_baseline.MY_SPOTLIGHTING,
+                        "--split",
+                        "holdout",
+                        "--case-plan",
+                        str(run_baseline.PHASE9_FRESH160_PLAN_PATH),
+                        "--expected-plan-sha256",
+                        run_baseline.PHASE9_FRESH160_PLAN_SHA256,
+                    ]
+                )
+            quota_guard.assert_not_called()
+
     def test_gemma_output_isolation_rejects_gemini_directories(self) -> None:
         for path in (
             run_baseline.GEMINI_BASELINE_ROOT / "results.jsonl",

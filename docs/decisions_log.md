@@ -1,45 +1,5 @@
 # Decisions Log
 
-### Phase 9 — Correct development manifest to Banking
-
-**Decision:** Replaced the Phase 9 development manifest's Workspace selection with a deterministic Banking-only transaction-memo manifest built from the five frozen `gemma4-banking-followup-v1` payload IDs.
-
-**Reason:** The prior manifest construction selected Workspace's `user_task_26` and Drive-specific vectors, so its committed defended rows did not represent the active Banking-only Phase 9 branch. The corrected builder binds the domain, channel, vector, task IDs, payload order, and six-field plan hash before execution.
-
-**Impact:** The prior Workspace defended artifacts are invalid for Phase 9 and are excluded; corrected built-in, custom, and matching undefended development results live under the model-separated output paths and remain disjoint from the 180-row Banking file-content follow-up plan.
-
-### Phase 9 — Repurpose the 20-row replication partition for validation
-
-**Decision:** Repurposed the exact 20 true-replication rows, derived from the original 46-row Banking discovery plan by deterministic triple comparison, as the Phase 9 development/validation manifest; the 160-fresh subset is now the sole primary Banking defended partition.
-
-**Reason:** The `file_content` and `transaction_memo` surfaces are exhausted, and two independently selected 20-row transaction-memo panels produced 0/40 native undefended successes, so a fresh development/validation manifest could not be constructed without changing the declared surfaces or methodology.
-
-**Impact:** The existing undefended Gemma index was filtered to the exact 20 keys (6/20 successes) without rerun; defended validation is stored under `data/defended/g4/v1/replication_dev/{builtin,custom}/`; the replication partition is permanently excluded from 9.6–9.8 and has no matched defended/undefended comparison.
-
-### Phase 9 — Deliberate deletion of obsolete null-validation artifacts
-
-**Decision:** After both amended defended validation arms completed successfully, deleted the obsolete transaction-memo null undefended run, its matching undefended directory, and the superseded development manifests/metadata named in the amended Phase 9 procedure.
-
-**Reason:** These artifacts were superseded by the deterministic replication-panel validation and were deliberately removed rather than retained as documented negative findings; keeping them would leave multiple incompatible Phase 9 manifests that could be mistaken for active evidence.
-
-**Impact:** The canonical development/validation evidence is the derived replication manifest, its validation report, and the two defended arms; the deleted paths are not valid inputs to later aggregation.
-
-### Phase 9 — Fix tool-position tracking across sequential tasks
-
-**Decision:** Changed `MySpotlightingLLM` from index-only tool-position tracking to exact transformed-message signatures and added a sequential-task regression test.
-
-**Reason:** Reusing one adapter instance for a second task whose first tool message occupied an index already marked in the first task left the new raw tool result unwrapped. The fix still prevents double-wrapping unchanged history while recognizing fresh content at a reused index.
-
-**Impact:** The frozen v1 source hash includes this correction (`7ce3de91c8dfd3c17532332d8f6516f3aa377bb2c40b22fe9371fc349a5200ee`); no later implementation changes are permitted without a new defense version and untouched panel.
-
-### Phase 9 — Freeze after amended validation panel
-
-**Decision:** Freeze the completed custom validation arm after the amended replication-panel checks, despite the old development utility-repeat threshold being non-passing relative to the deleted transaction-memo undefended checkpoint.
-
-**Reason:** The user-approved amendment makes the exhausted 20-row replication panel validation-only and permanently excludes it from 9.6–9.8; creating another transaction-memo development panel or repeatedly tuning on the same rows would violate that scope. Both defended arms completed with exact keys, error-free traces, and the Step 0 tracking fix in place.
-
-**Impact:** `my_spotlighting` v1 and its prompt/hash are immutable for the fresh-160 run; the implementation-validation metrics remain labeled development evidence and cannot be used as the primary defended estimate.
-
 ### Phase 3.5 - Provider switch: Groq -> Google AI Studio
 
 **Decision:** Replaced the planned Groq integration with a custom `Gemini3LLM`

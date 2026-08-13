@@ -93,6 +93,31 @@ def _read_index(path: Path, *, calibrated: bool) -> dict[tuple[str, ...], tuple[
     return output
 
 
+def _validate_undefended_arm(
+    index: dict[tuple[str, ...], tuple[RunResult, dict[str, Any]]],
+    *,
+    path: Path,
+) -> None:
+    """Require the comparison denominator to be a genuinely undefended arm."""
+
+    for key, (result, _trace) in index.items():
+        if result.defense != "none":
+            raise ValueError(
+                f"undefended comparison arm contains defense={result.defense!r} "
+                f"for {key} in {path}"
+            )
+        if result.split is not None or result.plan_sha256 is not None:
+            raise ValueError(
+                "undefended comparison arm contains defended-run split/plan "
+                f"provenance for {key} in {path}"
+            )
+        if result.defense_version is not None or result.defense_sha256 is not None:
+            raise ValueError(
+                "undefended comparison arm contains defense provenance for "
+                f"{key} in {path}"
+            )
+
+
 def _percentile(values: list[float], probability: float) -> float:
     ordered = sorted(values)
     position = (len(ordered) - 1) * probability
@@ -164,6 +189,7 @@ def summarize(*, plan_path: Path = FRESH_PLAN, defended_path: Path = FRESH_RESUL
         raise ValueError("fresh160 plan contains a replication triple")
     defended = _read_index(defended_path, calibrated=True)
     undefended = _read_index(undefended_path, calibrated=False)
+    _validate_undefended_arm(undefended, path=undefended_path)
     plan_keys = [_key(row) for row in plan_rows]
     if set(defended) != set(plan_keys) or len(defended) != 160:
         raise ValueError("defended index does not equal fresh160 plan")

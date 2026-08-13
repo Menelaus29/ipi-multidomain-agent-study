@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -23,14 +24,23 @@ CASE_FIELDS = (
     "injection_task_id",
 )
 DEFAULT_ROOT = Path("data/defended/g4/v1/replication_dev")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+EXPECTED_MODEL = "google-gemma-4-26b-a4b-it"
+BENCHMARK_VERSION = "v1.2.2"
+EXPECTED_BUILTIN_PIPELINE_PREFIX = "gemini-2.5-flash-preview-04-17-g4"
 
 
 def _read_manifest(path: Path) -> list[dict[str, str]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != CASE_FIELDS:
+            raise ValueError(f"unexpected manifest columns: {reader.fieldnames}")
         rows = [dict(row) for row in reader]
     if len(rows) != 20:
         raise ValueError(f"expected 20 manifest rows, found {len(rows)}")
+    keys = [_case_key(row) for row in rows]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"manifest contains duplicate case keys: {path}")
     return rows
 
 
@@ -45,6 +55,18 @@ def _raw_path(notes: str) -> Path:
     return Path(match.group(1))
 
 
+def _resolve_raw_path(reference: Path, *, raw_root: Path) -> Path:
+    candidate = reference if reference.is_absolute() else PROJECT_ROOT / reference
+    canonical = candidate.resolve()
+    try:
+        canonical.relative_to(raw_root.resolve())
+    except ValueError as exc:
+        raise ValueError(
+            f"raw trace is outside the result raw directory: {reference}"
+        ) from exc
+    return canonical
+
+
 def _case_key(row: dict[str, Any]) -> tuple[str, ...]:
     return tuple(str(row[field]) for field in CASE_FIELDS)
 
@@ -56,6 +78,7 @@ def validate_arm(
     expected_keys: list[tuple[str, ...]],
     plan_sha256: str,
 ) -> dict[str, Any]:
+    results_path = results_path.resolve()
     rows: list[RunResult] = []
     for line_number, line in enumerate(
         results_path.read_text(encoding="utf-8").splitlines(), start=1
@@ -70,6 +93,7 @@ def validate_arm(
     checks: list[dict[str, Any]] = []
     missing_traces: list[str] = []
     errored_traces: list[str] = []
+    traces: set[str] = set()
     for index, row in enumerate(rows):
         vector_match = re.search(r"(?:^|;) ?injection_vector=([^;]+)", row.notes)
         if vector_match is None:
@@ -83,15 +107,27 @@ def validate_arm(
             row.injection_task_id,
         )
         actual_keys.append(key)
-        if row.model != "google-gemma-4-26b-a4b-it":
+        if row.model != EXPECTED_MODEL:
             raise ValueError(f"{arm} row has wrong model: {row.model}")
         if row.split != "dev" or row.plan_sha256 != plan_sha256:
             raise ValueError(f"{arm} row has wrong split/plan provenance")
         if row.defense != ("spotlighting_with_delimiting" if arm == "builtin" else "my_spotlighting"):
             raise ValueError(f"{arm} row has wrong defense: {row.defense}")
-        raw_path = _raw_path(row.notes)
+        if (
+            row.attack_set_version != "static-corpus-v1"
+            or not row.attack_sha256
+            or not row.defense_version
+            or not row.defense_sha256
+        ):
+            raise ValueError(f"{arm} row has incomplete provenance")
+        raw_reference = _raw_path(row.notes)
+        raw_path = _resolve_raw_path(raw_reference, raw_root=results_path.parent / "r")
+        trace_key = str(raw_path).lower()
+        if trace_key in traces:
+            raise ValueError(f"{arm} duplicate raw trace: {raw_reference}")
+        traces.add(trace_key)
         if not raw_path.is_file():
-            missing_traces.append(str(raw_path))
+            missing_traces.append(str(raw_reference))
             continue
         raw = json.loads(raw_path.read_text(encoding="utf-8"))
         if raw.get("error") is not None:
@@ -100,6 +136,32 @@ def validate_arm(
             raise ValueError(f"{arm} verdict mismatch at {raw_path}")
         if raw.get("utility") != row.utility_success:
             raise ValueError(f"{arm} utility mismatch at {raw_path}")
+        if raw.get("messages") != row.tool_calls:
+            raise ValueError(f"{arm} message trace mismatch at {raw_path}")
+        if (
+            raw.get("suite_name") != row.domain
+            or raw.get("user_task_id") != row.user_task_id
+            or raw.get("injection_task_id") != row.injection_task_id
+            or raw.get("benchmark_version") != BENCHMARK_VERSION
+        ):
+            raise ValueError(f"{arm} raw/index case metadata mismatch at {raw_path}")
+        pipeline_name = raw.get("pipeline_name")
+        expected_pipeline = (
+            EXPECTED_BUILTIN_PIPELINE_PREFIX
+            if arm == "builtin"
+            else EXPECTED_MODEL
+        )
+        if not isinstance(pipeline_name, str) or not pipeline_name.startswith(expected_pipeline):
+            raise ValueError(f"{arm} raw/index model metadata mismatch at {raw_path}")
+        injections = raw.get("injections")
+        vector = vector_match.group(1)
+        if not isinstance(injections, Mapping) or vector not in injections:
+            raise ValueError(f"{arm} raw trace lacks rendered injection {vector!r}")
+        rendered = injections[vector]
+        if not isinstance(rendered, str):
+            raise ValueError(f"{arm} raw rendered injection is not text at {raw_path}")
+        if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != row.attack_sha256:
+            raise ValueError(f"{arm} raw/index attack hash mismatch at {raw_path}")
         tool_messages = [message for message in raw.get("messages", []) if message.get("role") == "tool"]
         checks.append(
             {
@@ -109,7 +171,7 @@ def validate_arm(
                 "raw_security": raw.get("security"),
                 "index_utility_success": row.utility_success,
                 "raw_utility": raw.get("utility"),
-                "raw_trace": str(raw_path),
+                "raw_trace": str(raw_reference),
                 "raw_error": raw.get("error"),
                 "tool_message_count": len(tool_messages),
                 "trace_bytes": raw_path.stat().st_size,

@@ -67,9 +67,13 @@ from src.defenses.builtin_spotlighting import (
     defense_version as builtin_defense_version,
 )
 from src.defenses.my_spotlighting import (
+    BEGIN_MARKER,
+    DATA_PREFIX,
     DEFENSE_NAME as MY_SPOTLIGHTING,
     DEFENSE_VERSION as MY_SPOTLIGHTING_VERSION,
+    END_MARKER,
     MySpotlightingLLM,
+    SYSTEM_PROMPT_FRAGMENT,
     defense_source_sha256,
 )
 from src.llm_providers.google_llm_factory import (
@@ -114,6 +118,7 @@ PHASE9_FRESH160_PLAN_PATH = (
 PHASE9_FRESH160_PLAN_SHA256 = (
     "0fcf3aadc5700ef5e1c40b5d5b5fc7242c7eaeb8a1225b525f1305e20cdf6f6b"
 )
+PHASE9_DEFENSE_FREEZE_PATH = PHASE9_GEMMA_V1_ROOT / "defense_freeze.json"
 PHASE9_BUILTIN_COMPACT_PIPELINE_NAME = "gemini-2.5-flash-preview-04-17-g4"
 DEFAULT_OUTPUT = GEMINI_BASELINE_ROOT / "results.jsonl"
 RAW_ROOT = GEMINI_BASELINE_ROOT / "raw"
@@ -1061,6 +1066,111 @@ def defense_provenance(defense: str) -> tuple[str, str]:
     raise BaselinePreflightError(f"unsupported defended mode: {defense!r}")
 
 
+def validate_phase9_defense_freeze(
+    freeze_path: Path | None = None,
+) -> Mapping[str, Any]:
+    """Verify the committed custom-defense freeze before held-out execution.
+
+    The fresh-160 run is a recorded evaluation of the exact frozen v1 defense.
+    Check every provenance-bearing artifact before entering the quota guard so a
+    stale or locally modified defense cannot consume requests or produce rows
+    that look like the frozen evaluation.
+    """
+
+    artifact_path = (freeze_path or PHASE9_DEFENSE_FREEZE_PATH).resolve()
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BaselinePreflightError(
+            f"Phase 9 defense freeze artifact is unreadable: {artifact_path}"
+        ) from exc
+    if not isinstance(artifact, dict):
+        raise BaselinePreflightError(
+            f"Phase 9 defense freeze artifact must be a JSON object: {artifact_path}"
+        )
+
+    expected_fields = {
+        "study_id": "gemma4-defense-validation-v1",
+        "defense": MY_SPOTLIGHTING,
+        "defense_version": MY_SPOTLIGHTING_VERSION,
+        "freeze_status": "frozen-before-fresh160",
+    }
+    for field, expected in expected_fields.items():
+        if artifact.get(field) != expected:
+            raise BaselinePreflightError(
+                f"Phase 9 defense freeze field {field!r} does not match {expected!r}"
+            )
+
+    expected_source_ref = "src/defenses/my_spotlighting.py"
+    if artifact.get("source_path") != expected_source_ref:
+        raise BaselinePreflightError(
+            "Phase 9 defense freeze source_path does not identify "
+            f"{expected_source_ref}"
+        )
+    source_path = (PROJECT_ROOT / expected_source_ref).resolve()
+    if not source_path.is_file():
+        raise BaselinePreflightError(
+            f"Phase 9 defense source is missing: {source_path}"
+        )
+    frozen_source_hash = artifact.get("source_sha256_canonical_lf")
+    current_source_hash = defense_source_sha256()
+    if frozen_source_hash != current_source_hash:
+        raise BaselinePreflightError(
+            "Phase 9 defense source hash does not match the committed freeze artifact"
+        )
+
+    expected_markers = {
+        "begin": BEGIN_MARKER,
+        "end": END_MARKER,
+        "data_prefix": DATA_PREFIX,
+    }
+    if artifact.get("markers") != expected_markers:
+        raise BaselinePreflightError(
+            "Phase 9 defense markers do not match the committed freeze artifact"
+        )
+    if artifact.get("system_prompt_fragment") != SYSTEM_PROMPT_FRAGMENT:
+        raise BaselinePreflightError(
+            "Phase 9 defense system prompt does not match the committed freeze artifact"
+        )
+
+    expected_artifact_refs = {
+        "validation_manifest": "data/defended/g4/v1/replication_dev/manifest.tsv",
+        "validation_report": "data/defended/g4/v1/replication_dev/validation_report.json",
+    }
+    for field, expected in expected_artifact_refs.items():
+        if artifact.get(field) != expected:
+            raise BaselinePreflightError(
+                f"Phase 9 defense freeze field {field!r} does not match {expected!r}"
+            )
+
+    for path_field, hash_field in (
+        ("validation_manifest", "validation_manifest_sha256"),
+        ("validation_report", "validation_report_sha256"),
+    ):
+        reference = artifact.get(path_field)
+        expected_hash = artifact.get(hash_field)
+        if not isinstance(reference, str) or not isinstance(expected_hash, str):
+            raise BaselinePreflightError(
+                f"Phase 9 defense freeze is missing {path_field}/{hash_field}"
+            )
+        referenced_path = Path(reference)
+        if not referenced_path.is_absolute():
+            referenced_path = PROJECT_ROOT / referenced_path
+        referenced_path = referenced_path.resolve()
+        if not referenced_path.is_file():
+            raise BaselinePreflightError(
+                f"Phase 9 defense freeze artifact is missing {path_field}: "
+                f"{referenced_path}"
+            )
+        actual_hash = hashlib.sha256(referenced_path.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise BaselinePreflightError(
+                f"Phase 9 defense freeze hash mismatch for {path_field}"
+            )
+
+    return cast(Mapping[str, Any], artifact)
+
+
 def pipeline_name_for_defense(target: BaselineTarget, defense: str) -> str:
     """Return AgentDojo's deterministic raw-trace pipeline component."""
 
@@ -1575,6 +1685,10 @@ def validate_phase9_holdout_protocol(
         raise SystemExit(
             "Phase 9 held-out evaluation requires the frozen fresh-160 plan SHA-256"
         )
+    try:
+        validate_phase9_defense_freeze()
+    except BaselinePreflightError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def run_cases(

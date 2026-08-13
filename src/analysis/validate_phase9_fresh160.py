@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -24,9 +25,11 @@ CASE_FIELDS = (
 )
 PLAN = Path("data/baseline_gemma4/banking_followup/plan_fresh160.tsv")
 ROOT = Path("data/defended/g4/v1/fresh160")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_PLAN_SHA256 = "0fcf3aadc5700ef5e1c40b5d5b5fc7242c7eaeb8a1225b525f1305e20cdf6f6b"
 EXPECTED_DEFENSE_SHA256 = "7ce3de91c8dfd3c17532332d8f6516f3aa377bb2c40b22fe9371fc349a5200ee"
 EXPECTED_MODEL = "google-gemma-4-26b-a4b-it"
+BENCHMARK_VERSION = "v1.2.2"
 
 
 def _sha256(path: Path) -> str:
@@ -53,6 +56,19 @@ def _note(notes: str, name: str) -> str:
     if match is None:
         raise ValueError(f"result notes lack {name}")
     return match.group(1)
+
+
+def _resolve_raw_path(reference: str, *, raw_root: Path) -> tuple[Path, Path]:
+    """Return the displayed note path and a contained canonical path."""
+
+    displayed = Path(reference)
+    candidate = displayed if displayed.is_absolute() else PROJECT_ROOT / displayed
+    canonical = candidate.resolve()
+    try:
+        canonical.relative_to(raw_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"raw trace is outside the result raw directory: {reference}") from exc
+    return displayed, canonical
 
 
 def validate(*, plan_path: Path = PLAN, results_path: Path = ROOT / "results.jsonl", output: Path | None = None) -> dict[str, Any]:
@@ -82,8 +98,10 @@ def validate(*, plan_path: Path = PLAN, results_path: Path = ROOT / "results.jso
             raise ValueError(f"row {index} has wrong defense provenance")
         if result.attack_set_version != "static-corpus-v1" or not result.attack_sha256:
             raise ValueError(f"row {index} has incomplete attack provenance")
-        raw_path = Path(_note(result.notes, "raw_trace"))
-        canonical = str(raw_path.resolve()).lower()
+        raw_reference, raw_path = _resolve_raw_path(
+            _note(result.notes, "raw_trace"), raw_root=results_path.parent / "r"
+        )
+        canonical = str(raw_path).lower()
         if canonical in traces:
             raise ValueError(f"duplicate raw trace: {raw_path}")
         traces.add(canonical)
@@ -96,6 +114,24 @@ def validate(*, plan_path: Path = PLAN, results_path: Path = ROOT / "results.jso
             raise ValueError(f"raw/index verdict mismatch: {raw_path}")
         if raw.get("messages") != result.tool_calls:
             raise ValueError(f"raw/index message mismatch: {raw_path}")
+        if (
+            raw.get("suite_name") != result.domain
+            or raw.get("user_task_id") != result.user_task_id
+            or raw.get("injection_task_id") != result.injection_task_id
+            or raw.get("benchmark_version") != BENCHMARK_VERSION
+        ):
+            raise ValueError(f"raw/index case metadata mismatch: {raw_path}")
+        pipeline_name = raw.get("pipeline_name")
+        if not isinstance(pipeline_name, str) or not pipeline_name.startswith(result.model):
+            raise ValueError(f"raw/index model metadata mismatch: {raw_path}")
+        injections = raw.get("injections")
+        if not isinstance(injections, Mapping) or vector not in injections:
+            raise ValueError(f"raw trace lacks rendered injection {vector!r}: {raw_path}")
+        rendered = injections[vector]
+        if not isinstance(rendered, str):
+            raise ValueError(f"raw rendered injection is not text: {raw_path}")
+        if hashlib.sha256(rendered.encode("utf-8")).hexdigest() != result.attack_sha256:
+            raise ValueError(f"raw/index attack hash mismatch: {raw_path}")
         tool_messages = [message for message in raw.get("messages", []) if message.get("role") == "tool"]
         checks.append({
             "row_index": index,
@@ -104,7 +140,7 @@ def validate(*, plan_path: Path = PLAN, results_path: Path = ROOT / "results.jso
             "raw_security": raw.get("security"),
             "index_utility_success": result.utility_success,
             "raw_utility": raw.get("utility"),
-            "raw_trace": str(raw_path),
+            "raw_trace": str(raw_reference),
             "tool_message_count": len(tool_messages),
             "trace_bytes": raw_path.stat().st_size,
             "first_tool_wrapped": BEGIN_MARKER in json.dumps(tool_messages[0], ensure_ascii=False) if tool_messages else False,
