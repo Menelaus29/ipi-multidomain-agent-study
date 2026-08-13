@@ -145,6 +145,10 @@ GEMMA_FOLLOWUP_BENCHMARK_VERSION = "v1.2.2"
 GEMMA_FOLLOWUP_PLAN_SHA256 = (
     "bc3e39fc087979621b57a2b85401912430fe83fc08c39cab980dcf2862e56b74"
 )
+GEMMA_FRESH160_PLAN_SHA256 = (
+    "0fcf3aadc5700ef5e1c40b5d5b5fc7242c7eaeb8a1225b525f1305e20cdf6f6b"
+)
+GEMMA_FRESH160_STUDY_ID = "gemma4-banking-defense-fresh160-v1"
 GEMMA_DISCOVERY_PLAN_SHA256 = (
     "d000809142e1624c7085cf3d01b5c3c782ca09c64c76f89bb9315c8c0ba6d050"
 )
@@ -585,6 +589,24 @@ def _enforce_recognized_protocol(
     """Prevent a known partitioned study from being relabeled by CLI arguments."""
     is_followup_plan = plan_sha256 == GEMMA_FOLLOWUP_PLAN_SHA256
     is_followup_label = study_id == GEMMA_FOLLOWUP_STUDY_ID
+    is_fresh160_plan = plan_sha256 == GEMMA_FRESH160_PLAN_SHA256
+    is_fresh160_label = study_id == GEMMA_FRESH160_STUDY_ID
+    if is_fresh160_plan:
+        if not is_fresh160_label:
+            raise AggregationError(
+                "the recognized Gemma Banking fresh160 plan must use study_id "
+                f"{GEMMA_FRESH160_STUDY_ID!r}"
+            )
+        if partition != "fresh":
+            raise AggregationError(
+                "the recognized Gemma Banking fresh160 plan must be selected as fresh"
+            )
+        if metadata_path is None or reference_plan_path is None:
+            raise AggregationError(
+                "the recognized Gemma Banking fresh160 plan requires committed "
+                "metadata and discovery reference plan"
+            )
+        return
     if is_followup_label and not is_followup_plan:
         raise AggregationError(
             f"study {GEMMA_FOLLOWUP_STUDY_ID!r} requires its frozen plan SHA-256"

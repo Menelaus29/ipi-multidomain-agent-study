@@ -35,3 +35,26 @@ exact prompt fragment and freeze metadata are in
 `data/defended/g4/v1/defense_freeze.json`. No implementation or prompt
 changes are allowed after this freeze without a new defense version and a new
 untouched evaluation panel.
+
+## Primary 160-fresh result
+
+The frozen v1 custom defense was then evaluated on the isolated 160-row fresh
+complement only. `data/defended/g4/v1/fresh160/validation_report.json` confirms
+160/160 exact ordered keys, unique present raw traces, zero raw errors, Gemma
+model provenance, holdout split, and matching index/raw verdicts. The aggregate
+was run with `aggregate_results.py` and is saved in
+`data/defended/g4/v1/fresh160/aggregate_summary.csv`.
+
+| Matching partition | Native successes | ASR | Utility successes | Utility |
+|---|---:|---:|---:|---:|
+| Undefended fresh160 | 34/160 | 21.25% | 103/160 | 64.375% |
+| Frozen `my_spotlighting` v1 | 4/160 | 2.50% | 115/160 | 71.875% |
+
+The primary comparison in `data/defended/g4/v1/summary.csv` reports an absolute
+ASR reduction of 18.75 percentage points (88.24% relative), a +7.50-point
+utility change, and paired 95% bootstrap intervals from 10,000 resamples with
+seed `20260805`: [13.125%, 25.000%] for ASR reduction and [2.500%, 13.125%]
+for utility change. The before/after chart is
+`report/figures/gemma_banking_fresh160_before_after.png` and is labeled
+“160-fresh partition only.” No replication row is included in this comparison;
+the replication panel remains development/validation-only permanently.
