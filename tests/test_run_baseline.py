@@ -317,7 +317,8 @@ class RunBaselineTests(unittest.TestCase):
             run_baseline.DEFENDED_ROOT
             / "g4"
             / "v1"
-            / "custom_dev"
+            / "replication_dev"
+            / "custom"
             / "results.jsonl"
         )
 
@@ -350,7 +351,8 @@ class RunBaselineTests(unittest.TestCase):
             run_baseline.DEFENDED_ROOT
             / "g4"
             / "v1"
-            / "builtin_dev"
+            / "replication_dev"
+            / "builtin"
             / "results.jsonl",
             builtin,
         )
@@ -358,7 +360,8 @@ class RunBaselineTests(unittest.TestCase):
             run_baseline.DEFENDED_ROOT
             / "g4"
             / "v1"
-            / "custom_dev"
+            / "replication_dev"
+            / "custom"
             / "results.jsonl",
             custom,
         )
@@ -380,10 +383,10 @@ class RunBaselineTests(unittest.TestCase):
                 "holdout",
             )
         run_baseline.validate_output_isolation(
-            run_baseline.GEMMA4_TARGET,
-            run_baseline.DEFENDED_ROOT / "g4" / "v1" / "full" / "results.jsonl",
-            run_baseline.MY_SPOTLIGHTING,
-            "holdout",
+                run_baseline.GEMMA4_TARGET,
+                run_baseline.DEFENDED_ROOT / "g4" / "v1" / "fresh160" / "results.jsonl",
+                run_baseline.MY_SPOTLIGHTING,
+                "holdout",
         )
 
     def test_defended_execution_requires_an_explicit_split(self) -> None:

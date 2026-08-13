@@ -103,10 +103,18 @@ GEMMA4_BASELINE_ROOT = PROJECT_ROOT / "data" / "baseline_gemma4"
 CALIBRATED_BASELINE_ROOT = PROJECT_ROOT / "data" / "calibrated_baseline"
 DEFENDED_ROOT = PROJECT_ROOT / "data" / "defended"
 PHASE9_GEMMA_V1_ROOT = DEFENDED_ROOT / "g4" / "v1"
-PHASE9_DEV_MANIFEST_PATH = PHASE9_GEMMA_V1_ROOT / "dev_manifest.tsv"
+PHASE9_REPLICATION_DEV_ROOT = PHASE9_GEMMA_V1_ROOT / "replication_dev"
+PHASE9_DEV_MANIFEST_PATH = PHASE9_REPLICATION_DEV_ROOT / "manifest.tsv"
 PHASE9_DEV_PLAN_SHA256 = (
-    "df0826f7cb52050f19a8a3d536ee8a6dbcd669ffb8deea49b7f40da2039669ef"
+    "66290a51809e53590bff01256e0463649895a83520227def097126434978d4c7"
 )
+PHASE9_FRESH160_PLAN_PATH = (
+    GEMMA4_BASELINE_ROOT / "banking_followup" / "plan_fresh160.tsv"
+)
+PHASE9_FRESH160_PLAN_SHA256 = (
+    "0fcf3aadc5700ef5e1c40b5d5b5fc7242c7eaeb8a1225b525f1305e20cdf6f6b"
+)
+PHASE9_BUILTIN_COMPACT_PIPELINE_NAME = "gemini-2.5-flash-preview-04-17-g4"
 DEFAULT_OUTPUT = GEMINI_BASELINE_ROOT / "results.jsonl"
 RAW_ROOT = GEMINI_BASELINE_ROOT / "raw"
 BENCHMARK_VERSION = "v1.2.2"
@@ -1057,7 +1065,12 @@ def pipeline_name_for_defense(target: BaselineTarget, defense: str) -> str:
     """Return AgentDojo's deterministic raw-trace pipeline component."""
 
     if defense == BUILTIN_SPOTLIGHTING:
-        return f"{target.pipeline_name}-{BUILTIN_SPOTLIGHTING}"
+        base_name = (
+            PHASE9_BUILTIN_COMPACT_PIPELINE_NAME
+            if target == GEMMA4_TARGET
+            else target.pipeline_name
+        )
+        return f"{base_name}-{BUILTIN_SPOTLIGHTING}"
     return target.pipeline_name
 
 
@@ -1065,12 +1078,12 @@ def development_output_root(target: BaselineTarget, defense: str) -> Path:
     """Return the Phase 9 development directory for one defense."""
 
     if defense == BUILTIN_SPOTLIGHTING:
-        component = "builtin_dev"
+        component = "builtin"
     elif defense == MY_SPOTLIGHTING:
-        component = "custom_dev"
+        component = "custom"
     else:
         raise BaselinePreflightError(f"unsupported defended mode: {defense!r}")
-    return defended_target_root(target) / component
+    return defended_target_root(target) / "replication_dev" / component
 
 
 def target_results_path(
@@ -1105,11 +1118,18 @@ def target_raw_root(
     split: str | None = None,
 ) -> Path:
     if defense == "none":
-        matrix_root = (
-            target.output_root
-            if matrix == "stratified"
-            else target.output_root / "full"
-        )
+        # Explicit result indexes (for example a matching Phase 9
+        # undefended denominator) own their raw-trace namespace.  Keeping
+        # those traces beside the requested index prevents a diagnostic run
+        # from mutating the frozen model baseline's raw-trace inventory.
+        if requested_results is not None:
+            matrix_root = requested_results.resolve().parent
+        else:
+            matrix_root = (
+                target.output_root
+                if matrix == "stratified"
+                else target.output_root / "full"
+            )
     elif requested_results is not None:
         matrix_root = requested_results.resolve().parent
     elif split == "dev":
@@ -1176,6 +1196,13 @@ def validate_output_isolation(
                     "holdout output cannot enter a reserved development directory: "
                     f"{resolved}"
                 )
+            if target == GEMMA4_TARGET and defense == MY_SPOTLIGHTING:
+                expected_holdout_root = defended_target_root(target) / "fresh160"
+                if not _is_relative_to(resolved, expected_holdout_root):
+                    raise BaselinePreflightError(
+                        "Phase 9 held-out output must remain below the fresh-160 "
+                        f"directory: {expected_holdout_root}"
+                    )
         return
     if target == GEMMA4_TARGET:
         if not _is_relative_to(resolved, GEMMA4_BASELINE_ROOT):
@@ -1313,6 +1340,12 @@ def execute_case(
         target_llm = MySpotlightingLLM(target_llm)
     benchmark_kwargs: dict[str, Any] = {}
     if defense == BUILTIN_SPOTLIGHTING:
+        if target == GEMMA4_TARGET:
+            # AgentDojo embeds the pipeline name in raw-trace paths. Keep the
+            # known Gemini-family compatibility token while shortening only
+            # this path component enough for the required replication_dev
+            # namespace on Windows.
+            target_llm.name = PHASE9_BUILTIN_COMPACT_PIPELINE_NAME
         benchmark_kwargs["defense"] = BUILTIN_SPOTLIGHTING
     results = benchmark_suite(
         suite=suite,
@@ -1522,6 +1555,28 @@ def validate_phase9_development_protocol(
         )
 
 
+def validate_phase9_holdout_protocol(
+    args: argparse.Namespace,
+    target: BaselineTarget,
+) -> None:
+    """Bind the frozen custom defense to the amended fresh-160 evaluation."""
+
+    if args.defense != MY_SPOTLIGHTING or args.split != "holdout":
+        return
+    if target != GEMMA4_TARGET:
+        raise SystemExit("Phase 9 held-out evaluation requires --target gemma4-26b")
+    if args.case_plan is None or (
+        args.case_plan.resolve() != PHASE9_FRESH160_PLAN_PATH.resolve()
+    ):
+        raise SystemExit(
+            "Phase 9 held-out evaluation may use only the committed fresh-160 plan"
+        )
+    if args.expected_plan_sha256 != PHASE9_FRESH160_PLAN_SHA256:
+        raise SystemExit(
+            "Phase 9 held-out evaluation requires the frozen fresh-160 plan SHA-256"
+        )
+
+
 def run_cases(
     args: argparse.Namespace,
     cases: Sequence[tuple[PayloadEntry, str, str, str, str]],
@@ -1692,6 +1747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("defended API execution requires --expected-plan-sha256")
     target = BASELINE_TARGETS[args.target]
     validate_phase9_development_protocol(args, target)
+    validate_phase9_holdout_protocol(args, target)
     payloads = load_corpus()
     cases = select_cases(args, payloads, target)
     selected_plan_sha256 = verify_expected_plan_sha256(
