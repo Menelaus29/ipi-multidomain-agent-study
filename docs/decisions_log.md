@@ -131,3 +131,39 @@ is permanently bypassed in favour of the Python API.
 **Reason:** The shared runner always received and raw-logged the native utility verdict, but its defense integration serialized that value only for defended rows. The later documentation described the resulting undefended nulls as "by design," even though they were a legacy serialization omission rather than an experimental or methodological requirement.
 
 **Impact:** Future undefended runs carry utility without requiring a development/holdout split; schemas and aggregation accept both legacy null and future boolean values, and populated values are checked against raw traces. Frozen `data/baseline/`, `data/baseline_gemma4/results.jsonl`, `data/baseline_gemma4/full/results.jsonl`, and all existing raw traces remain unchanged.
+
+### Phase 10 — Banking-only defense-adaptive scope
+
+**Decision:** Fix the Phase 10–11 defense-adaptive evaluation to the Banking
+`gemma4-banking-followup-v1` 160-fresh matched population and carry forward
+only undefended-success cases stopped by frozen `my_spotlighting` v1.
+
+**Reason:** The Gemma parity baseline produced five native AgentDojo successes,
+all in Banking, so only Banking proceeded to a defended evaluation; Workspace
+and Slack were never defended. Banking is therefore fixed by data availability,
+not selected through a cross-domain comparison of defended ASR.
+
+**Impact:** Adaptive artifacts live under `data/adaptive/g4/v1/`, remain
+separate from the Phase 9 static defended comparison, and support only a
+Banking- and selected-payload-specific finding rather than a cross-domain
+defense claim.
+
+### Phase 10 — Waiver of per-run Gemma dashboard reading
+
+**Decision:** Omit the build_guide.md requirement to read the Gemma RPD
+dashboard before each adaptive-loop API run; the code-level quota guard
+(hard cap, ledger reservation, lock) remains in force.
+
+**Reason:** The Gemma model (`gemma-4-26b-a4b-it`) has 30 RPM, 16k TPM, and
+14,400 RPD — substantially more than the full five-payload adaptive loop
+(≤25 target executions plus ≤25 proposer calls, well under 100 total API
+requests). The operator explicitly determined that the hard quota guard's
+code-level protections are sufficient without a manual dashboard reading
+before each run.
+
+**Impact:** `src/adaptive/adaptive_loop.py` still requires all four quota
+arguments (`--quota-date`, `--dashboard-used`, `--dashboard-limit`,
+`--max-api-requests`) and enters the `QuotaGuard` context, ensuring the
+ledger is updated correctly. The waiver applies only to the manual
+dashboard-verification step, not to the code-level enforcement.
+
