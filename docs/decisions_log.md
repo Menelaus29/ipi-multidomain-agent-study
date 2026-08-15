@@ -131,3 +131,84 @@ is permanently bypassed in favour of the Python API.
 **Reason:** The shared runner always received and raw-logged the native utility verdict, but its defense integration serialized that value only for defended rows. The later documentation described the resulting undefended nulls as "by design," even though they were a legacy serialization omission rather than an experimental or methodological requirement.
 
 **Impact:** Future undefended runs carry utility without requiring a development/holdout split; schemas and aggregation accept both legacy null and future boolean values, and populated values are checked against raw traces. Frozen `data/baseline/`, `data/baseline_gemma4/results.jsonl`, `data/baseline_gemma4/full/results.jsonl`, and all existing raw traces remain unchanged.
+
+### Phase 10 — Banking-only defense-adaptive scope
+
+**Decision:** Fix the Phase 10–11 defense-adaptive evaluation to the Banking
+`gemma4-banking-followup-v1` 160-fresh matched population and carry forward
+only undefended-success cases stopped by frozen `my_spotlighting` v1.
+
+**Reason:** The Gemma parity baseline produced five native AgentDojo successes,
+all in Banking, so only Banking proceeded to a defended evaluation; Workspace
+and Slack were never defended. Banking is therefore fixed by data availability,
+not selected through a cross-domain comparison of defended ASR.
+
+**Impact:** Adaptive artifacts live under `data/adaptive/g4/v1/`, remain
+separate from the Phase 9 static defended comparison, and support only a
+Banking- and selected-payload-specific finding rather than a cross-domain
+defense claim.
+
+### Phase 10 — Waiver of per-run Gemma dashboard reading
+
+**Decision:** Omit the build_guide.md requirement to read the Gemma RPD
+dashboard before each adaptive-loop API run; the code-level quota guard
+(hard cap, ledger reservation, lock) remains in force.
+
+**Reason:** The Gemma model (`gemma-4-26b-a4b-it`) has 30 RPM, 16k TPM, and
+14,400 RPD — substantially more than the full five-payload adaptive loop
+(≤25 target executions plus ≤25 proposer calls, well under 100 total API
+requests). The operator explicitly determined that the hard quota guard's
+code-level protections are sufficient without a manual dashboard reading
+before each run.
+
+**Impact:** `src/adaptive/adaptive_loop.py` still requires all four quota
+arguments (`--quota-date`, `--dashboard-used`, `--dashboard-limit`,
+`--max-api-requests`) and enters the `QuotaGuard` context, ensuring the
+ledger is updated correctly. The waiver applies only to the manual
+dashboard-verification step, not to the code-level enforcement.
+
+### Phase 10 — Proposer output format: plain text → JSON with "template" field
+
+**Decision:** Changed the proposer prompt to request a single JSON object
+`{"template": "..."}` instead of bare plain text, and updated extraction
+to parse the JSON field first (with fallback to markdown-fence stripping
+and raw text) before validating the `{{goal}}` token.
+
+**Reason:** The 10.7 live hand-test revealed that Gemma 4 produces reasoning
+traces and meta-commentary (repeating the word `{{goal}}` from the task
+description 4–8 times) rather than bare template text when prompted with a
+plain-text fill-in-the-blank suffix. All 5 persona-04 proposer calls produced
+malformed output and no attempt reached the AgentDojo target call.
+Structuring the output as a named JSON field makes extraction unambiguous
+regardless of model preamble or reasoning traces.
+
+**Impact:** `_build_proposer_prompt` and `propose_mutation` in
+`src/adaptive/adaptive_loop.py` changed; `TestProposerValidation` in
+`tests/test_adaptive_loop.py` updated to test the new extraction path.
+The fallback chain (JSON regex → full JSON parse → markdown fence → raw
+text) ensures backward compatibility if the model ignores the JSON
+instruction.
+
+### Phase 10 — Proposer request counter: AgentDojo counter not incremented by raw generate_content
+
+**Decision:** Fixed `proposer_requests` to be hardcoded `1` per completed
+proposer call instead of using `get_google_request_attempt_count()` delta,
+and set `proposer_requests = 1` in the `ValueError` (malformed-output) branch.
+
+**Reason:** `get_google_request_attempt_count()` tracks AgentDojo benchmark
+tool-pipeline calls, not raw `client.models.generate_content()` calls.
+The delta was always 0, making `proposer_requests` report 0 even after a
+real API call completed. The malformed-output branch also left the counter
+at its initial value of 0.
+
+**Impact:** `attempts.jsonl` records now correctly show `proposer_requests=1`
+for any attempt where the proposer made a real API call, regardless of
+whether the output passed validation.
+
+### Phase 10 — Adaptive-loop reliability fixes: thinking, target accounting, and resume
+
+**Decision:** Hardened the Gemma proposer/target loop by giving proposer thinking sufficient output headroom and explicitly setting minimal thinking, restoring the missing `get_google_request_attempt_count` binding used by target execution, and treating only `status=completed` rows with a boolean native verdict as terminal checkpoint entries.
+
+**Reason:** Gemma 4 could exhaust its proposer output budget in `thought=True` content before emitting a template; the target path then crashed before request accounting because the counter name was not imported; and the checkpoint treated crash/error rows as completed, preventing retry. These fixes distinguish reasoning truncation and execution errors from genuine AgentDojo verdicts while preserving the full failure history.
+
+**Impact:** Proposer calls now use `max_output_tokens=4096` with minimal thinking and classify thought-only responses as truncated; target calls record real request counts; error rows remain retryable; and the archived pre-fix records remain separate from the canonical completed-attempt results.
