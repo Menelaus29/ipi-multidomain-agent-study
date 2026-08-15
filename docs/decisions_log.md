@@ -167,3 +167,40 @@ arguments (`--quota-date`, `--dashboard-used`, `--dashboard-limit`,
 ledger is updated correctly. The waiver applies only to the manual
 dashboard-verification step, not to the code-level enforcement.
 
+### Phase 10 — Proposer output format: plain text → JSON with "template" field
+
+**Decision:** Changed the proposer prompt to request a single JSON object
+`{"template": "..."}` instead of bare plain text, and updated extraction
+to parse the JSON field first (with fallback to markdown-fence stripping
+and raw text) before validating the `{{goal}}` token.
+
+**Reason:** The 10.7 live hand-test revealed that Gemma 4 produces reasoning
+traces and meta-commentary (repeating the word `{{goal}}` from the task
+description 4–8 times) rather than bare template text when prompted with a
+plain-text fill-in-the-blank suffix. All 5 persona-04 proposer calls produced
+malformed output and no attempt reached the AgentDojo target call.
+Structuring the output as a named JSON field makes extraction unambiguous
+regardless of model preamble or reasoning traces.
+
+**Impact:** `_build_proposer_prompt` and `propose_mutation` in
+`src/adaptive/adaptive_loop.py` changed; `TestProposerValidation` in
+`tests/test_adaptive_loop.py` updated to test the new extraction path.
+The fallback chain (JSON regex → full JSON parse → markdown fence → raw
+text) ensures backward compatibility if the model ignores the JSON
+instruction.
+
+### Phase 10 — Proposer request counter: AgentDojo counter not incremented by raw generate_content
+
+**Decision:** Fixed `proposer_requests` to be hardcoded `1` per completed
+proposer call instead of using `get_google_request_attempt_count()` delta,
+and set `proposer_requests = 1` in the `ValueError` (malformed-output) branch.
+
+**Reason:** `get_google_request_attempt_count()` tracks AgentDojo benchmark
+tool-pipeline calls, not raw `client.models.generate_content()` calls.
+The delta was always 0, making `proposer_requests` report 0 even after a
+real API call completed. The malformed-output branch also left the counter
+at its initial value of 0.
+
+**Impact:** `attempts.jsonl` records now correctly show `proposer_requests=1`
+for any attempt where the proposer made a real API call, regardless of
+whether the output passed validation.

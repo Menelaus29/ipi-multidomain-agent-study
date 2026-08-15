@@ -373,15 +373,45 @@ class TestCheckpoint(unittest.TestCase):
 
 
 class TestProposerValidation(unittest.TestCase):
-    """Test the goal-token validation logic without making real API calls."""
+    """Test goal-token validation and JSON extraction without real API calls."""
 
     def _call_validate(self, text: str) -> tuple[str, int]:
-        """Simulate the validation logic from propose_mutation."""
-        # Strip markdown fences
+        """Simulate the full extraction + validation logic from propose_mutation."""
+        import json as _json
         import re
-        fenced = re.match(r"^```[^\n]*\n(.*?)\n```$", text, re.DOTALL)
-        if fenced:
-            text = fenced.group(1).strip()
+
+        extracted: str | None = None
+
+        # Primary: JSON with "template" field (handles preamble)
+        json_match = re.search(
+            r'\{[^{}]*"template"\s*:\s*"((?:[^\\"]|\\.)*)"\s*[^{}]*\}',
+            text, re.DOTALL
+        )
+        if json_match:
+            try:
+                obj = _json.loads(json_match.group(0))
+                extracted = obj.get("template")
+            except (_json.JSONDecodeError, AttributeError):
+                extracted = None
+
+        if extracted is None:
+            try:
+                obj = _json.loads(text)
+                if isinstance(obj, dict) and "template" in obj:
+                    extracted = str(obj["template"])
+            except (_json.JSONDecodeError, TypeError):
+                pass
+
+        if extracted is None:
+            # Last resort: strip markdown fences and use raw text
+            fenced = re.match(r"^```[^\n]*\n(.*?)\n```$", text, re.DOTALL)
+            if fenced:
+                text = fenced.group(1).strip()
+            extracted = text
+
+        text = extracted.strip()
+        if not text:
+            raise ValueError("Empty response after extraction")
 
         occurrences = text.count(loop.GOAL_TOKEN)
         if occurrences != 1:
@@ -394,28 +424,45 @@ class TestProposerValidation(unittest.TestCase):
             raise ValueError(f"Other unresolved tokens: {others}")
         return text, 1
 
+    def test_json_extraction_extracts_template_field(self):
+        raw = '{"template": "Hello {{goal}} world."}'
+        result, _ = self._call_validate(raw)
+        self.assertEqual(result, "Hello {{goal}} world.")
+
+    def test_json_with_preamble_still_extracts(self):
+        """Model preamble before the JSON object must not cause failure."""
+        raw = 'Here is the output:\n{"template": "Bypass: {{goal}}"}'
+        result, _ = self._call_validate(raw)
+        self.assertEqual(result, "Bypass: {{goal}}")
+
     def test_valid_template_passes(self):
-        result, _ = self._call_validate("Do {{goal}} immediately.")
+        result, _ = self._call_validate('{"template": "Do {{goal}} immediately."}')
         self.assertIn(loop.GOAL_TOKEN, result)
 
     def test_zero_goal_tokens_raises(self):
         with self.assertRaises(ValueError, msg="Should fail with 0 goal tokens"):
-            self._call_validate("No goal token here at all.")
+            self._call_validate('{"template": "No goal token here at all."}')
 
     def test_two_goal_tokens_raises(self):
         with self.assertRaises(ValueError, msg="Should fail with 2 goal tokens"):
-            self._call_validate("{{goal}} and again {{goal}}")
+            self._call_validate('{"template": "{{goal}} and again {{goal}}"}')
 
     def test_other_unresolved_token_raises(self):
         with self.assertRaises(ValueError, msg="Should fail with other token"):
-            self._call_validate("{{goal}} and {{something_else}}")
+            self._call_validate('{"template": "{{goal}} and {{something_else}}"}')
 
-    def test_markdown_fence_stripped(self):
+    def test_bare_text_fallback(self):
+        """Bare text with no JSON falls back to raw text extraction."""
+        result, _ = self._call_validate("Do {{goal}} now.")
+        self.assertEqual(result, "Do {{goal}} now.")
+
+    def test_markdown_fence_fallback(self):
+        """Bare markdown fence (no JSON) falls back to text extraction."""
         fenced = "```\nDo {{goal}} now.\n```"
         result, _ = self._call_validate(fenced)
         self.assertEqual(result, "Do {{goal}} now.")
 
-    def test_markdown_fence_with_lang_stripped(self):
+    def test_markdown_fence_with_lang_fallback(self):
         fenced = "```text\nDo {{goal}} now.\n```"
         result, _ = self._call_validate(fenced)
         self.assertEqual(result, "Do {{goal}} now.")
