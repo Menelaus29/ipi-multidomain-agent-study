@@ -149,6 +149,8 @@ QUOTA_KEY = GEMMA4_26B_MODEL
 
 # Only supported goal token in proposer-generated templates
 GOAL_TOKEN = "{{goal}}"
+PROPOSER_MAX_OUTPUT_TOKENS = 4096
+PROPOSER_THINKING_LEVEL = "minimal"
 
 _UNRESOLVED_TOKEN_RE = re.compile(r"\{\{[^{}]+\}\}")
 
@@ -218,6 +220,17 @@ class PlannedAttempt:
     mutation_round: int  # 1-based within this payload
 
 
+class ProposerTruncatedError(RuntimeError):
+    """Raised when Gemma emits thinking parts but no final answer part."""
+
+    def __init__(self, finish_reason: str) -> None:
+        self.finish_reason = finish_reason
+        super().__init__(
+            "Proposer produced only thought=True parts and no final answer "
+            f"(finish_reason={finish_reason})"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Manifest and data loading
 # ---------------------------------------------------------------------------
@@ -281,7 +294,7 @@ def load_strategy_descriptions() -> dict[str, str]:
 
 
 def load_completed_attempts() -> set[tuple[str, ...]]:
-    """Return keys of already-completed adaptive attempts from the checkpoint."""
+    """Return keys backed by a genuine completed AgentDojo verdict."""
     if not ATTEMPTS_JSONL_PATH.exists():
         return set()
     completed: set[tuple[str, ...]] = set()
@@ -297,7 +310,9 @@ def load_completed_attempts() -> set[tuple[str, ...]]:
             raise ValueError(
                 f"Malformed JSON in {ATTEMPTS_JSONL_PATH}:{line_no}: {exc}"
             ) from exc
-        if record.get("status") not in {"completed", "failed", "skipped"}:
+        if record.get("status") != "completed" or not isinstance(
+            record.get("attack_success"), bool
+        ):
             continue
         key: tuple[str, ...] = (
             str(record.get("payload_id", "")),
@@ -332,7 +347,7 @@ def load_payload_successes() -> set[str]:
 
 
 def count_payload_attempts_in_checkpoint() -> dict[str, int]:
-    """Return {payload_id: number_of_recorded_attempts} from the checkpoint."""
+    """Return completed-verdict counts; errors remain retryable on resume."""
     if not ATTEMPTS_JSONL_PATH.exists():
         return {}
     counts: dict[str, int] = {}
@@ -344,7 +359,9 @@ def count_payload_attempts_in_checkpoint() -> dict[str, int]:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if record.get("status") in {"completed", "failed", "skipped"}:
+        if record.get("status") == "completed" and isinstance(
+            record.get("attack_success"), bool
+        ):
             pid = record.get("payload_id", "")
             if pid:
                 counts[pid] = counts.get(pid, 0) + 1
@@ -476,6 +493,69 @@ def _build_proposer_prompt(
     )
 
 
+def _extract_proposer_template(text: str) -> str:
+    """Extract and validate the goal-bound template from final-answer text."""
+    extracted: str | None = None
+
+    # Try to find a JSON object anywhere in the output (handles preamble/postamble).
+    json_match = re.search(
+        r'\{[^{}]*"template"\s*:\s*"((?:[^\\"]|\\.)*)"[^{}]*\}',
+        text,
+        re.DOTALL,
+    )
+    if json_match:
+        try:
+            # Re-parse the full matched object to handle escapes correctly.
+            obj = json.loads(json_match.group(0))
+            extracted = obj.get("template")
+        except (json.JSONDecodeError, AttributeError):
+            extracted = None
+
+    if extracted is None:
+        # Fallback: try parsing the entire text as JSON.
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, dict) and "template" in obj:
+                extracted = str(obj["template"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if extracted is None:
+        # Last resort: strip markdown code fences and use raw text.
+        fenced = re.match(r"^```[^\n]*\n(.*?)\n```$", text, re.DOTALL)
+        if fenced:
+            text = fenced.group(1).strip()
+        extracted = text
+
+    template = extracted.strip()
+    if not template:
+        raise ValueError("Proposer returned an empty text response after extraction")
+
+    occurrences = template.count(GOAL_TOKEN)
+    if occurrences != 1:
+        raise ValueError(
+            f"Proposer output has {occurrences} occurrences of {GOAL_TOKEN!r}; "
+            f"exactly 1 required. Snippet: {template[:200]!r}"
+        )
+
+    others = _UNRESOLVED_TOKEN_RE.findall(template.replace(GOAL_TOKEN, ""))
+    if others:
+        raise ValueError(
+            f"Proposer output contains other unresolved tokens {others}. "
+            f"Snippet: {template[:200]!r}"
+        )
+
+    return template
+
+
+def _finish_reason_text(candidate: Any) -> str:
+    """Return a stable string for an SDK candidate finish reason."""
+    finish_reason = getattr(candidate, "finish_reason", None)
+    if finish_reason is None:
+        return "UNKNOWN"
+    return str(getattr(finish_reason, "value", finish_reason))
+
+
 def propose_mutation(
     *,
     strategy_id: str,
@@ -500,93 +580,52 @@ def propose_mutation(
 
     # The proposer uses the rate limiter via the LLM's _generate_content path
     # but makes a direct text generation call (no tool-use pipeline).
-    requests_before = get_google_request_attempt_count()
     proposer_llm._rate_limiter.wait_before_request()
     if proposer_llm._token_pacer is not None:
-        estimated = len(prompt.encode("utf-8")) // 3 + 256
+        estimated = (
+            len(prompt.encode("utf-8")) // 3 + PROPOSER_MAX_OUTPUT_TOKENS
+        )
         proposer_llm._token_pacer.wait_before_tokens(estimated)
 
     response = proposer_llm.client.models.generate_content(
         model=proposer_llm.model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(
-            max_output_tokens=1024,
+            max_output_tokens=PROPOSER_MAX_OUTPUT_TOKENS,
             tools=None,
+            thinking_config=genai_types.ThinkingConfig(
+                thinking_level=PROPOSER_THINKING_LEVEL
+            ),
         ),
     )
 
-    # The proposer bypasses AgentDojo's request counter; count 1 per completed
-    # generate_content call.  (get_google_request_attempt_count tracks benchmark
-    # tool-pipeline calls, not raw client.models.generate_content calls.)
+    # This function issues exactly one generate_content call. The explicit
+    # rate-limiter boundary above also increments the quota guard's process
+    # counter before the SDK request starts.
     requests_used = 1
-    _ = requests_before  # retained for future counter parity checks
 
     candidate = response.candidates[0] if response.candidates else None
     if candidate is None or not candidate.content or not candidate.content.parts:
         raise ValueError("Proposer returned an empty response")
 
-    text = "".join(
+    parts = candidate.content.parts
+    final_text = "".join(
         part.text
-        for part in candidate.content.parts
-        if hasattr(part, "text") and part.text
+        for part in parts
+        if getattr(part, "thought", None) is not True
+        and hasattr(part, "text")
+        and part.text
     ).strip()
 
-    if not text:
+    if not final_text and all(
+        getattr(part, "thought", None) is True for part in parts
+    ):
+        raise ProposerTruncatedError(_finish_reason_text(candidate))
+
+    if not final_text:
         raise ValueError("Proposer returned an empty text response")
 
-    # Primary extraction path: JSON with a "template" field.
-    # The prompt requests exactly this format.
-    import json as _json
-    extracted: str | None = None
-
-    # Try to find a JSON object anywhere in the output (handles preamble/postamble)
-    json_match = re.search(r'\{[^{}]*"template"\s*:\s*"((?:[^\\"]|\\.)*)"[^{}]*\}', text, re.DOTALL)
-    if json_match:
-        try:
-            # Re-parse the full matched object to handle escapes correctly
-            obj = _json.loads(json_match.group(0))
-            extracted = obj.get("template")
-        except (_json.JSONDecodeError, AttributeError):
-            extracted = None
-
-    if extracted is None:
-        # Fallback: try parsing the entire text as JSON
-        try:
-            obj = _json.loads(text)
-            if isinstance(obj, dict) and "template" in obj:
-                extracted = str(obj["template"])
-        except (_json.JSONDecodeError, TypeError):
-            pass
-
-    if extracted is None:
-        # Last resort: strip markdown code fences and use raw text
-        fenced = re.match(r"^```[^\n]*\n(.*?)\n```$", text, re.DOTALL)
-        if fenced:
-            text = fenced.group(1).strip()
-        extracted = text
-
-    text = extracted.strip()
-
-    if not text:
-        raise ValueError("Proposer returned an empty text response after extraction")
-
-    # Validate goal token
-    occurrences = text.count(GOAL_TOKEN)
-    if occurrences != 1:
-        raise ValueError(
-            f"Proposer output has {occurrences} occurrences of {GOAL_TOKEN!r}; "
-            f"exactly 1 required. Snippet: {text[:200]!r}"
-        )
-
-    # No other unresolved template tokens
-    others = _UNRESOLVED_TOKEN_RE.findall(text.replace(GOAL_TOKEN, ""))
-    if others:
-        raise ValueError(
-            f"Proposer output contains other unresolved tokens {others}. "
-            f"Snippet: {text[:200]!r}"
-        )
-
-    return text, requests_used
+    return _extract_proposer_template(final_text), requests_used
 
 
 # ---------------------------------------------------------------------------
@@ -786,6 +825,7 @@ def _build_attempt_record(
     target_result: dict[str, Any] | None,
     target_error: str | None = None,
     defense_sha256: str,
+    proposer_finish_reason: str | None = None,
 ) -> dict[str, Any]:
     """Build a complete attempt record for the checkpoint file."""
     mutated_sha256 = (
@@ -814,6 +854,7 @@ def _build_attempt_record(
         "proposer_status": proposer_status,
         "proposer_requests": proposer_requests,
         "proposer_error": proposer_error,
+        "proposer_finish_reason": proposer_finish_reason,
         # Mutated template
         "mutated_template": mutated_template,
         "mutated_template_sha256": mutated_sha256,
@@ -861,11 +902,15 @@ def run_adaptive_loop(
     *,
     payload_filter: str | None = None,
     dry_run: bool = False,
+    max_new_attempts: int | None = None,
 ) -> dict[str, Any]:
     """Run the full adaptive attack loop, checkpointing every attempt.
 
     Returns a summary dict.
     """
+    if max_new_attempts is not None and max_new_attempts <= 0:
+        raise ValueError("max_new_attempts must be positive when provided")
+
     eligible_cases = load_eligible_cases()
     corpus = load_corpus()
     strategy_descriptions = load_strategy_descriptions()
@@ -907,8 +952,16 @@ def run_adaptive_loop(
         "total_successes": 0,
         "payloads": {},
     }
+    new_attempts = 0
 
     for planned_attempt in planned:
+        if max_new_attempts is not None and new_attempts >= max_new_attempts:
+            logging.info(
+                "Stopping after %d new attempt(s) as requested",
+                max_new_attempts,
+            )
+            break
+
         pid = planned_attempt.attempt_key.payload_id
         attempt_key = planned_attempt.attempt_key
 
@@ -957,6 +1010,7 @@ def run_adaptive_loop(
         proposer_requests = 0
         mutated_template: str | None = None
         proposer_error: str | None = None
+        proposer_finish_reason: str | None = None
         proposer_status = "pending"
         injection_goal = get_injection_goal(case)
 
@@ -970,6 +1024,16 @@ def run_adaptive_loop(
                 proposer_llm=proposer_llm,
             )
             proposer_status = "accepted"
+        except ProposerTruncatedError as exc:
+            proposer_error = str(exc)
+            proposer_finish_reason = exc.finish_reason
+            proposer_status = "truncated"
+            proposer_requests = 1
+            logging.warning(
+                "Proposer truncated before final output for attempt %s: %s",
+                attempt_id[:12],
+                proposer_error,
+            )
         except ValueError as exc:
             proposer_error = str(exc)
             proposer_status = "malformed"
@@ -985,7 +1049,7 @@ def run_adaptive_loop(
                 attempt_id=attempt_id,
                 planned=planned_attempt,
                 case=case,
-                status="failed",
+                status="error",
                 proposer_status="quota_stop",
                 proposer_requests=proposer_requests,
                 proposer_error=str(exc),
@@ -1002,16 +1066,20 @@ def run_adaptive_loop(
                 attempt_id=attempt_id,
                 planned=planned_attempt,
                 case=case,
-                status="skipped",
+                status=(
+                    "truncated" if proposer_status == "truncated" else "skipped"
+                ),
                 proposer_status=proposer_status,
                 proposer_requests=proposer_requests,
                 proposer_error=proposer_error,
                 mutated_template=None,
                 target_result=None,
                 defense_sha256=expected_defense_sha256,
+                proposer_finish_reason=proposer_finish_reason,
             )
             append_attempt_record(record)
-            completed_keys.add(attempt_key.key_tuple)
+            new_attempts += 1
+            # Preserve the failed generation without making the round terminal.
             payload_attempt_counts[pid] = payload_attempt_counts.get(pid, 0) + 1
             continue
 
@@ -1032,7 +1100,7 @@ def run_adaptive_loop(
             final_status = "completed"
         except (RequestBudgetExceeded, ClientError) as exc:
             target_error = str(exc)
-            final_status = "failed"
+            final_status = "error"
             record = _build_attempt_record(
                 attempt_id=attempt_id,
                 planned=planned_attempt,
@@ -1050,7 +1118,7 @@ def run_adaptive_loop(
             raise
         except Exception as exc:
             target_error = str(exc)
-            final_status = "failed"
+            final_status = "error"
             logging.error(
                 "Target execution failed for attempt %s: %s",
                 attempt_id[:12],
@@ -1072,27 +1140,28 @@ def run_adaptive_loop(
             defense_sha256=expected_defense_sha256,
         )
         append_attempt_record(record)
-        completed_keys.add(attempt_key.key_tuple)
+        new_attempts += 1
+        if final_status == "completed":
+            completed_keys.add(attempt_key.key_tuple)
         payload_attempt_counts[pid] = payload_attempt_counts.get(pid, 0) + 1
 
         # Update prior-attempt feedback (only development feedback — no held-out)
-        prior_by_payload[pid].append(
-            {
-                "strategy_id": planned_attempt.strategy_id,
-                "mutated_template": mutated_template,
-                "attack_success": (
-                    target_result.get("attack_success", False)
-                    if target_result
-                    else False
-                ),
-            }
-        )
+        if final_status == "completed":
+            assert target_result is not None
+            # Only genuine development verdicts may become mutation feedback.
+            prior_by_payload[pid].append(
+                {
+                    "strategy_id": planned_attempt.strategy_id,
+                    "mutated_template": mutated_template,
+                    "attack_success": target_result["attack_success"],
+                }
+            )
 
-        # Update summary
-        summary["total_attempts"] += 1
-        if pid not in summary["payloads"]:
-            summary["payloads"][pid] = {"attempts": 0, "success": False}
-        summary["payloads"][pid]["attempts"] += 1
+            # Error rows preserve provenance but are not experimental results.
+            summary["total_attempts"] += 1
+            if pid not in summary["payloads"]:
+                summary["payloads"][pid] = {"attempts": 0, "success": False}
+            summary["payloads"][pid]["attempts"] += 1
 
         if target_result and target_result.get("attack_success"):
             payload_succeeded.add(pid)
@@ -1131,6 +1200,13 @@ def run_adaptive_loop(
 # ---------------------------------------------------------------------------
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1145,6 +1221,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--plan",
         action="store_true",
         help="Print planned attempts without making any API calls",
+    )
+    parser.add_argument(
+        "--max-new-attempts",
+        type=_positive_int,
+        help=(
+            "Stop after checkpointing this many new mutation attempts; "
+            "intended for bounded hand-tests and resumable batches"
+        ),
     )
     add_quota_arguments(parser, required=False)
     return parser.parse_args(argv)
@@ -1200,6 +1284,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary = run_adaptive_loop(
                 payload_filter=args.payload,
                 dry_run=False,
+                max_new_attempts=args.max_new_attempts,
             )
     except RequestBudgetExceeded as exc:
         print(f"Quota cap reached: {exc}", file=sys.stderr)

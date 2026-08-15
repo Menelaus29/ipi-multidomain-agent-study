@@ -204,3 +204,11 @@ at its initial value of 0.
 **Impact:** `attempts.jsonl` records now correctly show `proposer_requests=1`
 for any attempt where the proposer made a real API call, regardless of
 whether the output passed validation.
+
+### Phase 10 — Adaptive-loop reliability fixes: thinking, target accounting, and resume
+
+**Decision:** Hardened the Gemma proposer/target loop by giving proposer thinking sufficient output headroom and explicitly setting minimal thinking, restoring the missing `get_google_request_attempt_count` binding used by target execution, and treating only `status=completed` rows with a boolean native verdict as terminal checkpoint entries.
+
+**Reason:** Gemma 4 could exhaust its proposer output budget in `thought=True` content before emitting a template; the target path then crashed before request accounting because the counter name was not imported; and the checkpoint treated crash/error rows as completed, preventing retry. These fixes distinguish reasoning truncation and execution errors from genuine AgentDojo verdicts while preserving the full failure history.
+
+**Impact:** Proposer calls now use `max_output_tokens=4096` with minimal thinking and classify thought-only responses as truncated; target calls record real request counts; error rows remain retryable; and the archived pre-fix records remain separate from the canonical completed-attempt results.

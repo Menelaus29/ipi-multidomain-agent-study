@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -258,6 +259,7 @@ class TestCheckpoint(unittest.TestCase):
             "injection_vector": "injection_landloard_notice",
             "user_task_id": "user_task_12",
             "injection_task_id": "injection_task_0",
+            "attack_success": False,
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "attempts.jsonl"
@@ -270,22 +272,41 @@ class TestCheckpoint(unittest.TestCase):
             result,
         )
 
-    def test_failed_attempt_is_also_completed(self):
+    def test_error_attempt_is_not_completed(self):
         record = {
             "schema_version": 1,
-            "status": "failed",
+            "status": "error",
             "payload_id": "template-02",
             "strategy_id": "nested-marker-imitation",
             "injection_vector": "injection_landloard_notice",
             "user_task_id": "user_task_12",
             "injection_task_id": "injection_task_1",
+            "attack_success": None,
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "attempts.jsonl"
             path.write_text(json.dumps(record) + "\n", encoding="utf-8")
             with patch.object(loop, "ATTEMPTS_JSONL_PATH", path):
                 result = loop.load_completed_attempts()
-        self.assertEqual(len(result), 1)
+        self.assertEqual(result, set())
+
+    def test_completed_without_boolean_verdict_is_not_completed(self):
+        record = {
+            "schema_version": 1,
+            "status": "completed",
+            "payload_id": "persona-04",
+            "strategy_id": "delimiter-line-collision",
+            "injection_vector": "injection_landloard_notice",
+            "user_task_id": "user_task_12",
+            "injection_task_id": "injection_task_0",
+            "attack_success": None,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "attempts.jsonl"
+            path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            with patch.object(loop, "ATTEMPTS_JSONL_PATH", path):
+                result = loop.load_completed_attempts()
+        self.assertEqual(result, set())
 
     def test_in_progress_status_not_counted(self):
         record = {
@@ -368,6 +389,82 @@ class TestCheckpoint(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tests: target execution boundary
+# ---------------------------------------------------------------------------
+
+
+class TestTargetExecution(unittest.TestCase):
+    def test_run_target_reaches_verdict_with_real_request_counter_binding(self):
+        """Exercise run_target itself while replacing only external boundaries."""
+        case = _make_eligible_case()
+        attack_name = "adaptive-test-attack"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_root = root / "raw"
+            raw_path = loop._raw_trace_path(
+                raw_root / case.domain,
+                pipeline_name=loop.GEMMA4_26B_PIPELINE_NAME,
+                domain=case.domain,
+                user_task_id=case.user_task_id,
+                attack_name=attack_name,
+                injection_task_id=case.injection_task_id,
+            )
+
+            def fake_benchmark_suite(**kwargs: Any) -> dict[str, Any]:
+                raw_path.parent.mkdir(parents=True, exist_ok=True)
+                raw_path.write_text(
+                    json.dumps({"error": None, "messages": []}),
+                    encoding="utf-8",
+                )
+                return {
+                    "security_results": {
+                        (case.user_task_id, case.injection_task_id): False
+                    },
+                    "utility_results": {
+                        (case.user_task_id, case.injection_task_id): True
+                    },
+                }
+
+            fake_llm = SimpleNamespace(name=loop.GEMMA4_26B_PIPELINE_NAME)
+            with (
+                patch.object(loop, "PROJECT_ROOT", root),
+                patch.object(loop, "get_suite", return_value=object()),
+                patch.object(
+                    loop,
+                    "register_adaptive_attack",
+                    return_value=attack_name,
+                ),
+                patch.object(
+                    loop,
+                    "get_google_gemma4_26b_llm",
+                    return_value=fake_llm,
+                ),
+                patch.object(
+                    loop,
+                    "benchmark_suite",
+                    side_effect=fake_benchmark_suite,
+                ) as benchmark,
+            ):
+                result = loop.run_target(
+                    mutated_template="Retry {{goal}} now",
+                    case=case,
+                    attempt_id="a" * 24,
+                    strategy_id="delimiter-line-collision",
+                    payload_id="persona-04",
+                    raw_root=raw_root,
+                )
+
+        self.assertFalse(result["attack_success"])
+        self.assertTrue(result["utility_success"])
+        self.assertEqual(result["api_request_attempts"], 0)
+        self.assertEqual(benchmark.call_count, 1)
+        self.assertIsInstance(
+            benchmark.call_args.kwargs["model"], loop.MySpotlightingLLM
+        )
+
+
+# ---------------------------------------------------------------------------
 # Tests: proposer output validation
 # ---------------------------------------------------------------------------
 
@@ -376,53 +473,43 @@ class TestProposerValidation(unittest.TestCase):
     """Test goal-token validation and JSON extraction without real API calls."""
 
     def _call_validate(self, text: str) -> tuple[str, int]:
-        """Simulate the full extraction + validation logic from propose_mutation."""
-        import json as _json
-        import re
+        """Exercise the production JSON extraction and validation helper."""
+        return loop._extract_proposer_template(text), 1
 
-        extracted: str | None = None
-
-        # Primary: JSON with "template" field (handles preamble)
-        json_match = re.search(
-            r'\{[^{}]*"template"\s*:\s*"((?:[^\\"]|\\.)*)"\s*[^{}]*\}',
-            text, re.DOTALL
+    def _call_proposer(
+        self,
+        parts: list[SimpleNamespace],
+        *,
+        finish_reason: str,
+    ) -> tuple[tuple[str, int], dict[str, Any]]:
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=parts),
+            finish_reason=SimpleNamespace(value=finish_reason),
         )
-        if json_match:
-            try:
-                obj = _json.loads(json_match.group(0))
-                extracted = obj.get("template")
-            except (_json.JSONDecodeError, AttributeError):
-                extracted = None
+        response = SimpleNamespace(candidates=[candidate])
+        captured: dict[str, Any] = {}
 
-        if extracted is None:
-            try:
-                obj = _json.loads(text)
-                if isinstance(obj, dict) and "template" in obj:
-                    extracted = str(obj["template"])
-            except (_json.JSONDecodeError, TypeError):
-                pass
+        def generate_content(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return response
 
-        if extracted is None:
-            # Last resort: strip markdown fences and use raw text
-            fenced = re.match(r"^```[^\n]*\n(.*?)\n```$", text, re.DOTALL)
-            if fenced:
-                text = fenced.group(1).strip()
-            extracted = text
-
-        text = extracted.strip()
-        if not text:
-            raise ValueError("Empty response after extraction")
-
-        occurrences = text.count(loop.GOAL_TOKEN)
-        if occurrences != 1:
-            raise ValueError(
-                f"Proposer output has {occurrences} occurrences of "
-                f"{loop.GOAL_TOKEN!r}; exactly 1 required."
-            )
-        others = loop._UNRESOLVED_TOKEN_RE.findall(text.replace(loop.GOAL_TOKEN, ""))
-        if others:
-            raise ValueError(f"Other unresolved tokens: {others}")
-        return text, 1
+        proposer_llm = SimpleNamespace(
+            model="gemma-4-26b-a4b-it",
+            client=SimpleNamespace(
+                models=SimpleNamespace(generate_content=generate_content)
+            ),
+            _rate_limiter=SimpleNamespace(wait_before_request=lambda: None),
+            _token_pacer=None,
+        )
+        result = loop.propose_mutation(
+            strategy_id="delimiter-line-collision",
+            strategy_description="test strategy",
+            original_template="Original {{goal}}",
+            injection_goal="Synthetic AgentDojo goal",
+            prior_attempts=[],
+            proposer_llm=proposer_llm,
+        )
+        return result, captured
 
     def test_json_extraction_extracts_template_field(self):
         raw = '{"template": "Hello {{goal}} world."}'
@@ -466,6 +553,298 @@ class TestProposerValidation(unittest.TestCase):
         fenced = "```text\nDo {{goal}} now.\n```"
         result, _ = self._call_validate(fenced)
         self.assertEqual(result, "Do {{goal}} now.")
+
+    def test_thought_only_response_is_truncated(self):
+        parts = [
+            SimpleNamespace(
+                text="Reasoning that mentions {{goal}} repeatedly {{goal}}",
+                thought=True,
+            )
+        ]
+        with self.assertRaises(loop.ProposerTruncatedError) as raised:
+            self._call_proposer(parts, finish_reason="MAX_TOKENS")
+        self.assertEqual(raised.exception.finish_reason, "MAX_TOKENS")
+
+    def test_mixed_response_uses_only_non_thought_text(self):
+        parts = [
+            SimpleNamespace(
+                text="Reasoning {{goal}} {{goal}} that must be ignored",
+                thought=True,
+            ),
+            SimpleNamespace(
+                text='{"template": "Final {{goal}} template"}',
+                thought=False,
+            ),
+        ]
+        (template, requests), captured = self._call_proposer(
+            parts,
+            finish_reason="STOP",
+        )
+        self.assertEqual(template, "Final {{goal}} template")
+        self.assertEqual(requests, 1)
+        config = captured["config"]
+        self.assertEqual(config.max_output_tokens, 4096)
+        self.assertEqual(config.thinking_config.thinking_level.value, "MINIMAL")
+
+
+# ---------------------------------------------------------------------------
+# Tests: proposer failure classification in the loop checkpoint
+# ---------------------------------------------------------------------------
+
+
+class TestProposerFailureClassification(unittest.TestCase):
+    def test_resume_retries_seeded_error_status_round(self):
+        case = _make_eligible_case()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        first_strategy = loop.STRATEGY_IDS[0]
+        error_record = {
+            "schema_version": 1,
+            "attempt_id": loop.AdaptiveAttemptKey(
+                payload_id="persona-04",
+                strategy_id=first_strategy,
+                injection_vector=case.injection_vector,
+                user_task_id=case.user_task_id,
+                injection_task_id=case.injection_task_id,
+            ).attempt_id(),
+            "status": "error",
+            "payload_id": "persona-04",
+            "strategy_id": first_strategy,
+            "injection_vector": case.injection_vector,
+            "user_task_id": case.user_task_id,
+            "injection_task_id": case.injection_task_id,
+            "attack_success": None,
+            "target_error": "synthetic crash",
+        }
+        proposer = MagicMock(return_value=("Retried {{goal}}", 1))
+        target = MagicMock(
+            return_value={
+                "attack_success": False,
+                "utility_success": True,
+                "api_request_attempts": 1,
+                "raw_trace_path": "data/adaptive/g4/v1/results/raw/retry.json",
+                "elapsed_seconds": 0.1,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = Path(tmpdir) / "attempts.jsonl"
+            attempts_path.write_text(
+                json.dumps(error_record) + "\n", encoding="utf-8"
+            )
+            with (
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", attempts_path),
+                patch.object(loop, "load_eligible_cases", return_value=[case]),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+                patch.object(loop, "propose_mutation", proposer),
+                patch.object(loop, "run_target", target),
+                patch.object(loop, "atomic_write_json"),
+            ):
+                loop.run_adaptive_loop(
+                    payload_filter="persona-04",
+                    max_new_attempts=1,
+                )
+
+            records = [
+                json.loads(line)
+                for line in attempts_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(proposer.call_count, 1)
+        self.assertEqual(target.call_count, 1)
+        self.assertEqual([record["status"] for record in records], ["error", "completed"])
+        self.assertEqual(records[1]["attempt_id"], error_record["attempt_id"])
+        self.assertEqual(records[1]["mutation_round"], 1)
+
+    def test_target_exception_records_retryable_error_not_completed(self):
+        case = _make_eligible_case()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = Path(tmpdir) / "attempts.jsonl"
+            with (
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", attempts_path),
+                patch.object(loop, "load_eligible_cases", return_value=[case]),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+                patch.object(
+                    loop,
+                    "propose_mutation",
+                    return_value=("Mutated {{goal}}", 1),
+                ),
+                patch.object(
+                    loop,
+                    "run_target",
+                    side_effect=NameError("synthetic target crash"),
+                ),
+                patch.object(loop, "atomic_write_json"),
+            ):
+                summary = loop.run_adaptive_loop(
+                    payload_filter="persona-04",
+                    max_new_attempts=1,
+                )
+
+            record = json.loads(attempts_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record["status"], "error")
+        self.assertIsNone(record["attack_success"])
+        self.assertEqual(summary["total_attempts"], 0)
+
+    def test_thought_only_response_records_truncated_status(self):
+        case = _make_eligible_case()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = Path(tmpdir) / "attempts.jsonl"
+            run_target = MagicMock()
+            with (
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", attempts_path),
+                patch.object(loop, "load_eligible_cases", return_value=[case]),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+                patch.object(
+                    loop,
+                    "propose_mutation",
+                    side_effect=loop.ProposerTruncatedError("MAX_TOKENS"),
+                ),
+                patch.object(loop, "run_target", run_target),
+                patch.object(loop, "atomic_write_json"),
+            ):
+                loop.run_adaptive_loop(
+                    payload_filter="persona-04",
+                    max_new_attempts=1,
+                )
+
+            records = [
+                json.loads(line)
+                for line in attempts_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "truncated")
+        self.assertEqual(records[0]["proposer_status"], "truncated")
+        self.assertEqual(records[0]["proposer_finish_reason"], "MAX_TOKENS")
+        self.assertEqual(records[0]["proposer_requests"], 1)
+        run_target.assert_not_called()
+
+    def test_bound_executes_one_proposer_and_one_target(self):
+        case = _make_eligible_case()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        proposer = MagicMock(return_value=("Mutated {{goal}}", 1))
+        target = MagicMock(
+            return_value={
+                "attack_success": False,
+                "utility_success": True,
+                "api_request_attempts": 2,
+                "raw_trace_path": "data/adaptive/g4/v1/results/raw/test.json",
+                "elapsed_seconds": 1.0,
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = Path(tmpdir) / "attempts.jsonl"
+            with (
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", attempts_path),
+                patch.object(loop, "load_eligible_cases", return_value=[case]),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+                patch.object(loop, "propose_mutation", proposer),
+                patch.object(loop, "run_target", target),
+                patch.object(loop, "atomic_write_json"),
+            ):
+                loop.run_adaptive_loop(
+                    payload_filter="persona-04",
+                    max_new_attempts=1,
+                )
+
+            records = [
+                json.loads(line)
+                for line in attempts_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(proposer.call_count, 1)
+        self.assertEqual(target.call_count, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["mutation_round"], 1)
+        self.assertEqual(records[0]["status"], "completed")
+
+    def test_malformed_round_one_does_not_advance_to_round_two(self):
+        case = _make_eligible_case()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        proposer = MagicMock(side_effect=ValueError("bad JSON shape"))
+        target = MagicMock()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            attempts_path = Path(tmpdir) / "attempts.jsonl"
+            with (
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", attempts_path),
+                patch.object(loop, "load_eligible_cases", return_value=[case]),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+                patch.object(loop, "propose_mutation", proposer),
+                patch.object(loop, "run_target", target),
+                patch.object(loop, "atomic_write_json"),
+            ):
+                loop.run_adaptive_loop(
+                    payload_filter="persona-04",
+                    max_new_attempts=1,
+                )
+
+            records = [
+                json.loads(line)
+                for line in attempts_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertEqual(proposer.call_count, 1)
+        target.assert_not_called()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["mutation_round"], 1)
+        self.assertEqual(records[0]["status"], "skipped")
+        self.assertEqual(records[0]["proposer_status"], "malformed")
 
 
 # ---------------------------------------------------------------------------
@@ -573,6 +952,7 @@ class TestAttemptRecord(unittest.TestCase):
             "proposer_status",
             "proposer_requests",
             "proposer_error",
+            "proposer_finish_reason",
             "mutated_template",
             "mutated_template_sha256",
             "target_model",
@@ -687,6 +1067,50 @@ class TestCLI(unittest.TestCase):
     def test_goal_token_constant(self):
         """The only supported goal token must be {{goal}}."""
         self.assertEqual(loop.GOAL_TOKEN, "{{goal}}")
+
+    def test_max_new_attempts_flag_reaches_loop(self):
+        guard = MagicMock()
+        guard.__enter__.return_value = guard
+        manifest = {
+            "target_defense": {"source_sha256_canonical_lf": "frozen-sha"}
+        }
+        with (
+            patch.object(loop, "defense_source_sha256", return_value="frozen-sha"),
+            patch.object(loop, "load_strategy_manifest", return_value=manifest),
+            patch.object(loop, "quota_guard_from_args", return_value=guard),
+            patch.object(
+                loop,
+                "run_adaptive_loop",
+                return_value={
+                    "total_attempts": 1,
+                    "total_successes": 0,
+                    "payloads": {},
+                },
+            ) as run_loop,
+        ):
+            rc = loop.main(
+                [
+                    "--payload",
+                    "persona-04",
+                    "--max-new-attempts",
+                    "1",
+                    "--quota-date",
+                    "2026-08-15",
+                    "--dashboard-used",
+                    "11",
+                    "--dashboard-limit",
+                    "14400",
+                    "--max-api-requests",
+                    "10",
+                ]
+            )
+
+        self.assertEqual(rc, 0)
+        run_loop.assert_called_once_with(
+            payload_filter="persona-04",
+            dry_run=False,
+            max_new_attempts=1,
+        )
 
 
 if __name__ == "__main__":
