@@ -671,10 +671,12 @@ def plan_attempts(
 ) -> list[PlannedAttempt]:
     """Build the deterministic ordered list of attempts.
 
-    Order: canonical payload order → strategy index → case (manifest order).
-    Strategy cycles first so each payload's budget covers maximum diversity.
-    Each payload receives exactly MAX_MUTATIONS_PER_PAYLOAD slots; the
-    loop enforces stopping on success or budget exhaustion at runtime.
+    Order: canonical payload order → strategy index (rounds 1–5).
+    Each payload's 5-mutation budget is spent against one fixed case:
+    the first eligible case in manifest order for that payload.  Only
+    the strategy advances each round; the case never changes within a
+    payload.  The loop enforces stopping on success or budget exhaustion
+    at runtime.
     """
     payload_ids = (
         (payload_filter,) if payload_filter else CARRIED_FORWARD_PAYLOAD_IDS
@@ -701,9 +703,12 @@ def plan_attempts(
         if payload is None:
             raise ValueError(f"Payload {payload_id!r} not found in corpus")
 
+        # Fixed case: always the first eligible case in manifest order.
+        # All 5 mutation strategies are applied against this one case.
+        fixed_case = cases[0]
         for mutation_round in range(1, MAX_MUTATIONS_PER_PAYLOAD + 1):
             strategy = strategy_list[(mutation_round - 1) % len(strategy_list)]
-            case = cases[(mutation_round - 1) % len(cases)]
+            case = fixed_case
             key = AdaptiveAttemptKey(
                 payload_id=payload_id,
                 strategy_id=strategy,

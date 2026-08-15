@@ -148,7 +148,8 @@ class TestPlanAttempts(unittest.TestCase):
         rounds = [p.mutation_round for p in plans]
         self.assertEqual(rounds, list(range(1, loop.MAX_MUTATIONS_PER_PAYLOAD + 1)))
 
-    def test_plan_strategies_cycle(self):
+    def test_plan_strategies_advance_each_round(self):
+        """Only the strategy advances per round; case is fixed."""
         plans = loop.plan_attempts(
             self.eligible, self.corpus, self.strategy_descriptions,
             payload_filter="persona-04",
@@ -158,6 +159,40 @@ class TestPlanAttempts(unittest.TestCase):
             for i in range(loop.MAX_MUTATIONS_PER_PAYLOAD)
         ]
         self.assertEqual([p.strategy_id for p in plans], expected_strategies)
+
+    def test_plan_uses_fixed_first_case(self):
+        """All 5 rounds use the first eligible case in manifest order."""
+        # Provide two eligible cases; only the first should ever appear.
+        case_first = loop.EligibleCase(
+            payload_id="persona-04",
+            domain="banking",
+            channel="file_content",
+            injection_vector="injection_bill_text",
+            user_task_id="user_task_0",
+            injection_task_id="injection_task_8",
+        )
+        case_second = loop.EligibleCase(
+            payload_id="persona-04",
+            domain="banking",
+            channel="file_content",
+            injection_vector="injection_landloard_notice",
+            user_task_id="user_task_12",
+            injection_task_id="injection_task_0",
+        )
+        eligible_two = [case_first, case_second]
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        desc = {sid: "d" for sid in loop.STRATEGY_IDS}
+        plans = loop.plan_attempts(
+            eligible_two, corpus, desc, payload_filter="persona-04"
+        )
+        self.assertEqual(len(plans), loop.MAX_MUTATIONS_PER_PAYLOAD)
+        for p in plans:
+            self.assertEqual(p.case.user_task_id, "user_task_0",
+                             "All rounds must use the first case's user_task_id")
+            self.assertEqual(p.case.injection_task_id, "injection_task_8",
+                             "All rounds must use the first case's injection_task_id")
+            self.assertEqual(p.case.injection_vector, "injection_bill_text",
+                             "All rounds must use the first case's injection_vector")
 
     def test_plan_all_payloads_total(self):
         """All 5 payloads × 5 mutations = 25 planned attempts."""

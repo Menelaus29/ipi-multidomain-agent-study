@@ -145,10 +145,13 @@ on the first native AgentDojo success against the frozen `my_spotlighting`
 v1 defense, or after five mutation attempts are exhausted — whichever comes
 first.
 
-Concretely, the loop cycles attempts across strategies and the payload's
-eligible stopped cases in a deterministic order (strategy index first, then
-case order from `eligible_stopped_cases.tsv`). Each (strategy, case) pair
-that is attempted counts as one mutation against the per-payload budget.
+Concretely, for each payload the loop selects **one fixed case**: the
+first eligible stopped case in `eligible_stopped_cases.tsv` manifest order
+for that payload. All five mutation strategies are applied sequentially
+against that fixed (user_task_id, injection_task_id, injection_vector)
+context. Only the strategy advances each round; the case does not change.
+Each (strategy, fixed-case) pair that is attempted counts as one mutation
+against the per-payload budget.
 
 ### Global stopping rule
 
