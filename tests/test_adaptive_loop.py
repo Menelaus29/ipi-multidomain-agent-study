@@ -846,6 +846,116 @@ class TestProposerFailureClassification(unittest.TestCase):
         self.assertEqual(records[0]["status"], "skipped")
         self.assertEqual(records[0]["proposer_status"], "malformed")
 
+    def test_scoped_runs_preserve_full_checkpoint_summary(self):
+        """A later payload-scoped run must not discard earlier totals."""
+        first_case = _make_eligible_case()
+        second_case = _make_eligible_case(
+            payload_id="template-02",
+            injection_vector="injection_bill_text",
+            user_task_id="user_task_0",
+            injection_task_id="injection_task_1",
+        )
+        cases = [first_case, second_case]
+        corpus = {
+            case.payload_id: _make_corpus_entry(case.payload_id)
+            for case in cases
+        }
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        first_key = loop.AdaptiveAttemptKey(
+            payload_id=first_case.payload_id,
+            strategy_id=loop.STRATEGY_IDS[0],
+            injection_vector=first_case.injection_vector,
+            user_task_id=first_case.user_task_id,
+            injection_task_id=first_case.injection_task_id,
+        )
+        prior_error = {
+            "schema_version": 1,
+            "attempt_id": first_key.attempt_id(),
+            "status": "error",
+            "payload_id": first_case.payload_id,
+            "strategy_id": first_key.strategy_id,
+            "injection_vector": first_case.injection_vector,
+            "user_task_id": first_case.user_task_id,
+            "injection_task_id": first_case.injection_task_id,
+            "attack_success": None,
+        }
+        proposer = MagicMock(return_value=("Mutated {{goal}}", 1))
+        target = MagicMock(
+            side_effect=[
+                {
+                    "attack_success": False,
+                    "utility_success": True,
+                    "api_request_attempts": 1,
+                    "raw_trace_path": "first.json",
+                    "elapsed_seconds": 0.1,
+                },
+                {
+                    "attack_success": True,
+                    "utility_success": True,
+                    "api_request_attempts": 1,
+                    "raw_trace_path": "second.json",
+                    "elapsed_seconds": 0.1,
+                },
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            attempts_path = root / "attempts.jsonl"
+            attempts_path.write_text(
+                json.dumps(prior_error) + "\n", encoding="utf-8"
+            )
+            adaptive_root = root / "adaptive"
+            with (
+                patch.object(loop, "ADAPTIVE_ROOT", adaptive_root),
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", attempts_path),
+                patch.object(loop, "load_eligible_cases", return_value=cases),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+                patch.object(loop, "propose_mutation", proposer),
+                patch.object(loop, "run_target", target),
+            ):
+                first_summary = loop.run_adaptive_loop(
+                    payload_filter=first_case.payload_id,
+                    max_new_attempts=1,
+                )
+                second_summary = loop.run_adaptive_loop(
+                    payload_filter=second_case.payload_id,
+                    max_new_attempts=1,
+                )
+
+            persisted_summary = json.loads(
+                (adaptive_root / "loop_summary.json").read_text(encoding="utf-8")
+            )
+            records = [
+                json.loads(line)
+                for line in attempts_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        expected = {
+            "total_attempts": 2,
+            "total_successes": 1,
+            "payloads": {
+                "persona-04": {"attempts": 1, "success": False},
+                "template-02": {"attempts": 1, "success": True},
+            },
+        }
+        self.assertEqual(first_summary["total_attempts"], 1)
+        self.assertEqual(second_summary, expected)
+        self.assertEqual(persisted_summary, expected)
+        self.assertEqual(
+            [record["status"] for record in records],
+            ["error", "completed", "completed"],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: budget enforcement via stopping rules

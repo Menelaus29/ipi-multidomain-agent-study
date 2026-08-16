@@ -144,6 +144,14 @@ CASE_FIELDS = (
     "injection_task_id",
 )
 
+ATTEMPT_KEY_FIELDS = (
+    "payload_id",
+    "strategy_id",
+    "injection_vector",
+    "user_task_id",
+    "injection_task_id",
+)
+
 # Quota key for all adaptive API calls
 QUOTA_KEY = GEMMA4_26B_MODEL
 
@@ -293,6 +301,23 @@ def load_strategy_descriptions() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _is_completed_verdict(record: Any) -> bool:
+    """Return whether a checkpoint row contains a completed verdict."""
+    return (
+        isinstance(record, dict)
+        and record.get("status") == "completed"
+        and isinstance(record.get("attack_success"), bool)
+    )
+
+
+def _completed_attempt_key(record: Any) -> tuple[str, ...] | None:
+    """Return the checkpoint key for a completed verdict record."""
+    if not _is_completed_verdict(record):
+        return None
+    key = tuple(str(record.get(field, "")) for field in ATTEMPT_KEY_FIELDS)
+    return key if all(key) else None
+
+
 def load_completed_attempts() -> set[tuple[str, ...]]:
     """Return keys backed by a genuine completed AgentDojo verdict."""
     if not ATTEMPTS_JSONL_PATH.exists():
@@ -310,18 +335,8 @@ def load_completed_attempts() -> set[tuple[str, ...]]:
             raise ValueError(
                 f"Malformed JSON in {ATTEMPTS_JSONL_PATH}:{line_no}: {exc}"
             ) from exc
-        if record.get("status") != "completed" or not isinstance(
-            record.get("attack_success"), bool
-        ):
-            continue
-        key: tuple[str, ...] = (
-            str(record.get("payload_id", "")),
-            str(record.get("strategy_id", "")),
-            str(record.get("injection_vector", "")),
-            str(record.get("user_task_id", "")),
-            str(record.get("injection_task_id", "")),
-        )
-        if all(key):
+        key = _completed_attempt_key(record)
+        if key is not None:
             completed.add(key)
     return completed
 
@@ -359,13 +374,65 @@ def count_payload_attempts_in_checkpoint() -> dict[str, int]:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if record.get("status") == "completed" and isinstance(
-            record.get("attack_success"), bool
-        ):
+        if _is_completed_verdict(record):
             pid = record.get("payload_id", "")
-            if pid:
-                counts[pid] = counts.get(pid, 0) + 1
+            if not pid:
+                continue
+            counts[pid] = counts.get(pid, 0) + 1
     return counts
+
+
+def load_latest_completed_attempts() -> dict[tuple[str, ...], dict[str, Any]]:
+    """Return the latest completed verdict record for each attempt key.
+
+    The append-only checkpoint can contain retry rows for one deterministic
+    attempt key, such as an ``error`` row followed by a ``completed`` retry.
+    Only completed verdict rows are eligible for the summary, and assigning as
+    we scan preserves the latest completed row for each key.
+    """
+    if not ATTEMPTS_JSONL_PATH.exists():
+        return {}
+
+    completed: dict[tuple[str, ...], dict[str, Any]] = {}
+    for line_no, line in enumerate(
+        ATTEMPTS_JSONL_PATH.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Malformed JSON in {ATTEMPTS_JSONL_PATH}:{line_no}: {exc}"
+            ) from exc
+        key = _completed_attempt_key(record)
+        if key is not None:
+            completed[key] = record
+    return completed
+
+
+def build_loop_summary_from_checkpoint() -> dict[str, Any]:
+    """Build aggregate loop statistics from the full append-only checkpoint."""
+    completed = load_latest_completed_attempts()
+    payloads: dict[str, dict[str, Any]] = {}
+    for key in sorted(completed):
+        payload_id = key[0]
+        payload_summary = payloads.setdefault(
+            payload_id,
+            {"attempts": 0, "success": False},
+        )
+        payload_summary["attempts"] += 1
+        if completed[key]["attack_success"]:
+            payload_summary["success"] = True
+
+    return {
+        "total_attempts": len(completed),
+        "total_successes": sum(
+            1 for record in completed.values() if record["attack_success"]
+        ),
+        "payloads": payloads,
+    }
 
 
 def append_attempt_record(record: dict[str, Any]) -> None:
@@ -947,11 +1014,6 @@ def run_adaptive_loop(
         pid: [] for pid in CARRIED_FORWARD_PAYLOAD_IDS
     }
 
-    summary: dict[str, Any] = {
-        "total_attempts": 0,
-        "total_successes": 0,
-        "payloads": {},
-    }
     new_attempts = 0
 
     for planned_attempt in planned:
@@ -1157,16 +1219,8 @@ def run_adaptive_loop(
                 }
             )
 
-            # Error rows preserve provenance but are not experimental results.
-            summary["total_attempts"] += 1
-            if pid not in summary["payloads"]:
-                summary["payloads"][pid] = {"attempts": 0, "success": False}
-            summary["payloads"][pid]["attempts"] += 1
-
         if target_result and target_result.get("attack_success"):
             payload_succeeded.add(pid)
-            summary["total_successes"] += 1
-            summary["payloads"][pid]["success"] = True
             logging.info(
                 "SUCCESS: payload %r bypassed defense on attempt %s "
                 "(strategy=%r, %s \u00d7 %s)",
@@ -1190,6 +1244,7 @@ def run_adaptive_loop(
             )
 
     # Write summary artifact
+    summary = build_loop_summary_from_checkpoint()
     summary_path = ADAPTIVE_ROOT / "loop_summary.json"
     atomic_write_json(summary_path, summary)
     return summary

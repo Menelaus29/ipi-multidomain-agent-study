@@ -212,3 +212,11 @@ whether the output passed validation.
 **Reason:** Gemma 4 could exhaust its proposer output budget in `thought=True` content before emitting a template; the target path then crashed before request accounting because the counter name was not imported; and the checkpoint treated crash/error rows as completed, preventing retry. These fixes distinguish reasoning truncation and execution errors from genuine AgentDojo verdicts while preserving the full failure history.
 
 **Impact:** Proposer calls now use `max_output_tokens=4096` with minimal thinking and classify thought-only responses as truncated; target calls record real request counts; error rows remain retryable; and the archived pre-fix records remain separate from the canonical completed-attempt results.
+
+### Phase 11 — Gemma-only bypass verification reconciliation
+
+**Decision:** On 2026-08-16, reconciled build-guide task 11.4a with the executed Gemma-only design by requiring confirmed bypasses to have completed row and raw-trace evidence that both proposer and target use `gemma-4-26b-a4b-it`, with no fallback/testing-model substitution; no separate cross-model confirmation run is required.
+
+**Reason:** The stale task text referred to `get_google_primary_llm()` from the archived Gemini Phase 6A track, while `adaptive_loop.py` uses `get_google_gemma4_26b_llm()` for both roles to preserve consistency with the Phase 9 recorded baseline. Because the proposer and target already share the designated recorded model, a primary-versus-cross-model confirmation split is inapplicable.
+
+**Impact:** Phase 11 case-study recording now validates the completed `data/adaptive/g4/v1/attempts.jsonl` row and referenced raw trace for Gemma model provenance before counting a bypass; no adaptive code or existing experiment artifact is changed.
