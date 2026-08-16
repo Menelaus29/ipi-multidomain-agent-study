@@ -1340,6 +1340,12 @@ class TestV2ContextManifest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "context 1"):
             self._load_with_rows(rows)
 
+    def test_swapped_later_contexts_rejected(self):
+        rows = self._manifest_rows()
+        rows[1]["context_index"], rows[2]["context_index"] = "3", "2"
+        with self.assertRaisesRegex(ValueError, "committed manifest order"):
+            self._load_with_rows(rows)
+
     def test_unknown_payload_rejected(self):
         rows = self._manifest_rows()
         rows[0]["payload_id"] = "encoding-99"
@@ -1362,6 +1368,31 @@ class TestV2ContextManifest(unittest.TestCase):
         rows[0]["source_manifest_row"] = "999"
         with self.assertRaisesRegex(ValueError, "outside the eligible manifest"):
             self._load_with_rows(rows)
+
+
+class TestV2DesignFreeze(unittest.TestCase):
+    def test_committed_freezes_and_all_source_hashes_verify(self):
+        for arm_id in ("v2a", "v2b"):
+            manifest = loop.verify_v2_design_freeze(loop.ARMS[arm_id])
+            self.assertEqual(manifest["arm"], arm_id)
+
+    def test_modified_design_file_is_rejected(self):
+        original = loop.V2A_ROOT / "design_freeze.json"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "v2a"
+            root.mkdir()
+            modified = original.read_text(encoding="utf-8").replace(
+                '"max_mutations_per_payload": 20',
+                '"max_mutations_per_payload": 21',
+            )
+            (root / "design_freeze.json").write_text(
+                modified, encoding="utf-8"
+            )
+            with (
+                patch.object(loop, "V2A_ROOT", root),
+                self.assertRaisesRegex(ValueError, "design-freeze hash mismatch"),
+            ):
+                loop.verify_v2_design_freeze(loop.ARMS["v2a"])
 
 
 class TestV2Planning(unittest.TestCase):
@@ -1476,17 +1507,35 @@ class TestArmSeparation(unittest.TestCase):
         ]
 
     def _patches(self, tmpdir: Path, cases: list[loop.EligibleCase]):
-        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        context_map = {
+            pid: [
+                loop.EligibleCase(
+                    payload_id=pid,
+                    domain=case.domain,
+                    channel=case.channel,
+                    injection_vector=case.injection_vector,
+                    user_task_id=case.user_task_id,
+                    injection_task_id=case.injection_task_id,
+                )
+                for case in cases
+            ]
+            for pid in loop.CARRIED_FORWARD_PAYLOAD_IDS
+        }
+        corpus = {
+            pid: _make_corpus_entry(pid)
+            for pid in loop.CARRIED_FORWARD_PAYLOAD_IDS
+        }
         descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
         return (
             patch.object(loop, "V2A_ROOT", tmpdir / "v2a"),
             patch.object(loop, "V2B_ROOT", tmpdir / "v2b"),
             patch.object(loop, "load_eligible_cases", return_value=cases[:1]),
-            patch.object(loop, "load_v2_contexts", return_value={"persona-04": cases}),
+            patch.object(loop, "load_v2_contexts", return_value=context_map),
             patch.object(loop, "load_corpus", return_value=corpus),
             patch.object(
                 loop, "load_strategy_descriptions", return_value=descriptions
             ),
+            patch.object(loop, "verify_v2_design_freeze", return_value={}),
             patch.object(loop, "defense_source_sha256", return_value="abc123"),
             patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
             patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
@@ -1508,6 +1557,34 @@ class TestArmSeparation(unittest.TestCase):
             ),
         )
 
+    def _run_v2a(
+        self,
+        tmpdir: Path,
+        cases: list[loop.EligibleCase],
+        *,
+        max_new_attempts: int | None = 1,
+        proposer_side_effect: Any | None = None,
+        target_side_effect: Any | None = None,
+        proposer_llm: Any | None = None,
+    ) -> tuple[dict[str, Any], MagicMock, MagicMock]:
+        patches = self._patches(tmpdir, cases)
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4],
+            patches[5], patches[6], patches[7], patches[8], patches[9],
+            patches[10] as proposer, patches[11] as target,
+        ):
+            if proposer_side_effect is not None:
+                proposer.side_effect = proposer_side_effect
+            if target_side_effect is not None:
+                target.side_effect = target_side_effect
+            summary = loop.run_adaptive_loop(
+                payload_filter="persona-04",
+                max_new_attempts=max_new_attempts,
+                arm_id="v2a",
+                proposer_llm=proposer_llm,
+            )
+        return summary, proposer, target
+
     def test_v2a_writes_only_its_own_root(self):
         cases = self._four_cases()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1518,7 +1595,7 @@ class TestArmSeparation(unittest.TestCase):
                 patches[0], patches[1],
                 patch.object(loop, "ATTEMPTS_JSONL_PATH", v1_attempts),
                 patches[2], patches[3], patches[4], patches[5], patches[6],
-                patches[7], patches[8], patches[9], patches[10],
+                patches[7], patches[8], patches[9], patches[10], patches[11],
             ):
                 summary = loop.run_adaptive_loop(
                     payload_filter="persona-04",
@@ -1540,6 +1617,131 @@ class TestArmSeparation(unittest.TestCase):
             self.assertEqual(record["target_model"], loop.GEMMA4_26B_MODEL)
             self.assertEqual(record["mutation_round"], 1)
             self.assertEqual(summary["total_attempts"], 1)
+
+    def test_v2_resume_reconstructs_prior_completed_feedback(self):
+        cases = self._four_cases()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            self._run_v2a(tmpdir, cases)
+            captured: list[list[dict[str, Any]]] = []
+
+            def propose_with_capture(**kwargs: Any) -> tuple[str, int]:
+                captured.append([dict(row) for row in kwargs["prior_attempts"]])
+                return "Round two {{goal}}", 1
+
+            summary, proposer, _ = self._run_v2a(
+                tmpdir,
+                cases,
+                proposer_side_effect=propose_with_capture,
+            )
+
+            proposer.assert_called_once()
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(len(captured[0]), 1)
+            self.assertEqual(
+                captured[0][0],
+                {
+                    "strategy_id": loop.STRATEGY_IDS[0],
+                    "mutated_template": "Mutated {{goal}}",
+                    "attack_success": False,
+                },
+            )
+            self.assertEqual(summary["total_attempts"], 2)
+
+    def test_v2_malformed_round_remains_consumed_after_restart(self):
+        cases = self._four_cases()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            first, _, first_target = self._run_v2a(
+                tmpdir,
+                cases,
+                proposer_side_effect=ValueError("bad JSON shape"),
+            )
+            first_target.assert_not_called()
+            self.assertEqual(first["total_attempts"], 1)
+
+            second, second_proposer, second_target = self._run_v2a(
+                tmpdir, cases
+            )
+            second_proposer.assert_called_once()
+            second_target.assert_called_once()
+            self.assertEqual(second["total_attempts"], 2)
+
+            records = [
+                json.loads(line)
+                for line in (tmpdir / "v2a" / "attempts.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual([row["mutation_round"] for row in records], [1, 2])
+            self.assertEqual(records[0]["proposer_status"], "malformed")
+
+    def test_v2_checkpoint_wrong_version_is_rejected(self):
+        cases = self._four_cases()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            self._run_v2a(tmpdir, cases)
+            attempts = tmpdir / "v2a" / "attempts.jsonl"
+            record = json.loads(attempts.read_text(encoding="utf-8"))
+            record["adaptive_attack_version"] = "v2b"
+            attempts.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                ValueError, "adaptive_attack_version mismatch"
+            ):
+                self._run_v2a(tmpdir, cases)
+
+    def test_v2_target_error_retries_without_regenerating_proposal(self):
+        cases = self._four_cases()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            with self.assertRaisesRegex(RuntimeError, "target interrupted"):
+                self._run_v2a(
+                    tmpdir,
+                    cases,
+                    target_side_effect=RuntimeError("target interrupted"),
+                )
+
+            summary, proposer, target = self._run_v2a(tmpdir, cases)
+            proposer.assert_not_called()
+            target.assert_called_once()
+            self.assertEqual(summary["total_attempts"], 1)
+
+            records = [
+                json.loads(line)
+                for line in (tmpdir / "v2a" / "attempts.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual([row["status"] for row in records], ["error", "completed"])
+            self.assertEqual(records[0]["mutated_template"], records[1]["mutated_template"])
+            self.assertEqual(records[1]["proposer_requests"], 0)
+
+    def test_v2_client_error_records_started_proposer_request(self):
+        cases = self._four_cases()
+        limiter = SimpleNamespace(requests_started=0)
+        proposer_llm = SimpleNamespace(_rate_limiter=limiter)
+
+        def fail_after_start(**_: Any) -> tuple[str, int]:
+            limiter.requests_started += 1
+            raise loop.ClientError(
+                429, {"error": {"status": "RESOURCE_EXHAUSTED"}}
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            with self.assertRaises(loop.ClientError):
+                self._run_v2a(
+                    tmpdir,
+                    cases,
+                    proposer_side_effect=fail_after_start,
+                    proposer_llm=proposer_llm,
+                )
+            record = json.loads(
+                (tmpdir / "v2a" / "attempts.jsonl").read_text(encoding="utf-8")
+            )
+            self.assertEqual(record["proposer_status"], "quota_stop")
+            self.assertEqual(record["proposer_requests"], 1)
 
     def test_v1_run_does_not_touch_v2_roots(self):
         case = _make_eligible_case()
@@ -1594,18 +1796,39 @@ class TestArmSeparation(unittest.TestCase):
 
     def test_v2_budget_exhaustion_skips_proposer(self):
         cases = self._four_cases()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        planned = loop.plan_attempts(
+            cases[:1],
+            corpus,
+            descriptions,
+            payload_filter="persona-04",
+            arm_id="v2a",
+            context_map={"persona-04": cases},
+        )
         seeded = [
-            {
-                "schema_version": 1,
-                "status": "completed",
-                "payload_id": "persona-04",
-                "strategy_id": loop.STRATEGY_IDS[i % 5],
-                "injection_vector": cases[i % 4].injection_vector,
-                "user_task_id": cases[i % 4].user_task_id,
-                "injection_task_id": cases[i % 4].injection_task_id,
-                "attack_success": False,
-            }
-            for i in range(20)
+            loop._build_attempt_record(
+                attempt_id=item.attempt_key.attempt_id(),
+                planned=item,
+                case=item.case,
+                status="completed",
+                proposer_status="accepted",
+                proposer_requests=1,
+                proposer_error=None,
+                mutated_template=f"M{item.mutation_round} {{{{goal}}}}",
+                target_result={
+                    "attack_success": False,
+                    "utility_success": True,
+                    "api_request_attempts": 1,
+                    "raw_trace_path": "x.json",
+                    "elapsed_seconds": 0.1,
+                },
+                defense_sha256="abc123",
+                adaptive_version="v2a",
+                proposer_model=loop.GEMMA4_26B_MODEL,
+                target_model=loop.GEMMA4_26B_MODEL,
+            )
+            for item in planned
         ]
         with tempfile.TemporaryDirectory() as tmp:
             tmpdir = Path(tmp)
@@ -1618,9 +1841,9 @@ class TestArmSeparation(unittest.TestCase):
             with (
                 patches[0], patches[1],
                 patches[2], patches[3], patches[4], patches[5], patches[6],
-                patches[7], patches[8],
-                patches[9] as proposer,
-                patches[10] as target,
+                patches[7], patches[8], patches[9],
+                patches[10] as proposer,
+                patches[11] as target,
             ):
                 summary = loop.run_adaptive_loop(
                     payload_filter="persona-04", arm_id="v2a"
@@ -1703,6 +1926,29 @@ class TestV2bProvenance(unittest.TestCase):
 
 
 class TestV2CLI(unittest.TestCase):
+    def test_design_freeze_failure_prevents_quota_reservation(self):
+        with (
+            patch.object(
+                loop,
+                "verify_v2_design_freeze",
+                side_effect=ValueError("tampered freeze"),
+            ),
+            patch.object(loop, "quota_guard_from_args") as guard_factory,
+            patch.object(loop, "run_adaptive_loop") as run_loop,
+        ):
+            rc = loop.main(
+                [
+                    "--arm", "v2a",
+                    "--quota-date", "2026-08-15",
+                    "--dashboard-used", "0",
+                    "--dashboard-limit", "14400",
+                    "--max-api-requests", "10",
+                ]
+            )
+        self.assertEqual(rc, 1)
+        guard_factory.assert_not_called()
+        run_loop.assert_not_called()
+
     def test_v2b_missing_proposer_quota_args_returns_error(self):
         manifest = {"target_defense": {"source_sha256_canonical_lf": "frozen-sha"}}
         with (

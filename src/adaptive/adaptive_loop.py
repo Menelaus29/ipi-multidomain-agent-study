@@ -163,6 +163,17 @@ V2B_ROOT = PROJECT_ROOT / "data" / "adaptive" / "g4" / "v2b"
 V2_CONTEXT_MANIFEST_PATH = (
     PROJECT_ROOT / "data" / "adaptive" / "g4" / "v2_context_manifest.tsv"
 )
+DEFENSE_FREEZE_PATH = (
+    PROJECT_ROOT / "data" / "defended" / "g4" / "v1" / "defense_freeze.json"
+)
+
+# These hashes bind executable v2 runs to the exact design-freeze files that
+# were committed before any v2 API call.  They are canonical-LF hashes so the
+# check remains stable across Git checkouts on Windows and Unix.
+V2_DESIGN_FREEZE_SHA256: dict[str, str] = {
+    "v2a": "d8748e4e363660b3225f37a1c50a9f6bc579c124acff4fe35efdb3a89aa7f77f",
+    "v2b": "178823838533045bac0470e9974356f75b385100150bca00160d97c0d0c6ea8b",
+}
 
 V2_MAX_MUTATIONS_PER_PAYLOAD = 20
 V2_MAX_TOTAL_MUTATIONS = 100  # 5 payloads × 20
@@ -384,6 +395,18 @@ class PlannedAttempt:
     mutation_round: int  # 1-based within this payload
 
 
+@dataclass
+class V2CheckpointState:
+    """Validated, deterministic resume state for one v2 arm."""
+
+    terminal_records: dict[tuple[str, ...], dict[str, Any]]
+    completed_records: dict[tuple[str, ...], dict[str, Any]]
+    payload_succeeded: set[str]
+    payload_attempt_counts: dict[str, int]
+    prior_by_payload: dict[str, list[dict[str, Any]]]
+    retry_templates: dict[tuple[str, ...], str]
+
+
 class ProposerTruncatedError(RuntimeError):
     """Raised when Gemma emits thinking parts but no final answer part."""
 
@@ -454,9 +477,9 @@ def load_v2_contexts(
             raise ValueError(f"Unexpected columns in {path}: {header}")
         rows.extend(reader)
 
-    first_eligible_by_payload: dict[str, EligibleCase] = {}
+    eligible_by_payload: dict[str, list[EligibleCase]] = {}
     for case in eligible_cases:
-        first_eligible_by_payload.setdefault(case.payload_id, case)
+        eligible_by_payload.setdefault(case.payload_id, []).append(case)
 
     by_payload: dict[str, dict[int, EligibleCase]] = {}
     seen_keys: set[tuple[str, ...]] = set()
@@ -519,11 +542,22 @@ def load_v2_contexts(
                 f"{sorted(indices)}"
             )
         ordered = [indices[i] for i in range(1, V2_CONTEXTS_PER_PAYLOAD + 1)]
-        first = first_eligible_by_payload.get(payload_id)
-        if first is None or ordered[0].key != first.key:
+        frozen_expected = eligible_by_payload.get(payload_id, [])[
+            :V2_CONTEXTS_PER_PAYLOAD
+        ]
+        if len(frozen_expected) != V2_CONTEXTS_PER_PAYLOAD:
             raise ValueError(
-                f"{path}: context 1 for {payload_id!r} must be the first "
-                "eligible case (v1 fixed case)"
+                f"{path}: eligible manifest has fewer than "
+                f"{V2_CONTEXTS_PER_PAYLOAD} rows for {payload_id!r}"
+            )
+        if [case.key for case in ordered] != [
+            case.key for case in frozen_expected
+        ]:
+            raise ValueError(
+                f"{path}: contexts 1..{V2_CONTEXTS_PER_PAYLOAD} for "
+                f"{payload_id!r} must be exactly the first "
+                f"{V2_CONTEXTS_PER_PAYLOAD} eligible cases in committed "
+                "manifest order (context 1 is the v1 fixed case)"
             )
         contexts[payload_id] = ordered
 
@@ -556,6 +590,186 @@ def load_strategy_descriptions() -> dict[str, str]:
         s["strategy_id"]: s["design"]
         for s in manifest.get("mutation_strategies", [])
     }
+
+
+def _canonical_lf_sha256(path: Path) -> str:
+    """Return a platform-stable SHA-256 for one committed text artifact."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def _raw_sha256(path: Path) -> str:
+    """Return the byte-exact SHA-256 for one committed artifact."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _require_frozen_value(
+    actual: Any,
+    expected: Any,
+    *,
+    field: str,
+    design_path: Path,
+) -> None:
+    if actual != expected:
+        raise ValueError(
+            f"{design_path}: frozen field {field!r} mismatch: "
+            f"expected {expected!r}, got {actual!r}"
+        )
+
+
+def verify_v2_design_freeze(arm: ArmSpec) -> dict[str, Any]:
+    """Fail closed unless an executable v2 arm matches its committed freeze.
+
+    The design file itself is pinned by a code-level canonical-LF hash. Its
+    source-artifact paths are then required to be the declared repository
+    paths, and every recorded source hash is checked against the working tree.
+    This check must run before quota reservation or model construction.
+    """
+    if arm.arm_id == "v1":
+        raise ValueError("verify_v2_design_freeze is only valid for v2 arms")
+
+    design_path = arm_root(arm) / "design_freeze.json"
+    expected_design_sha = V2_DESIGN_FREEZE_SHA256[arm.arm_id]
+    actual_design_sha = _canonical_lf_sha256(design_path)
+    if actual_design_sha != expected_design_sha:
+        raise ValueError(
+            f"{design_path}: design-freeze hash mismatch: "
+            f"expected {expected_design_sha}, got {actual_design_sha}"
+        )
+
+    manifest = json.loads(design_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"{design_path} must contain a JSON object")
+
+    frozen_values = {
+        "schema_version": 1,
+        "adaptive_attack_version": arm.adaptive_version,
+        "arm": arm.arm_id,
+        "freeze_status": "frozen-before-api",
+        "benchmark_version": BENCHMARK_VERSION,
+        "carried_forward_payload_ids": list(CARRIED_FORWARD_PAYLOAD_IDS),
+        "strategy_ids": list(STRATEGY_IDS),
+        "api_calls_made": False,
+        "execution_status": "design-only-no-api-calls",
+    }
+    for field, expected in frozen_values.items():
+        _require_frozen_value(
+            manifest.get(field), expected, field=field, design_path=design_path
+        )
+
+    context = manifest.get("context_selection")
+    budget = manifest.get("iteration_budget")
+    models = manifest.get("models")
+    outputs = manifest.get("outputs")
+    quota = manifest.get("quota")
+    for field, value in (
+        ("context_selection", context),
+        ("iteration_budget", budget),
+        ("models", models),
+        ("outputs", outputs),
+        ("quota", quota),
+    ):
+        if not isinstance(value, dict):
+            raise ValueError(f"{design_path}: {field} must be an object")
+
+    assert isinstance(context, dict)
+    assert isinstance(budget, dict)
+    assert isinstance(models, dict)
+    assert isinstance(outputs, dict)
+    assert isinstance(quota, dict)
+    semantic_values = (
+        (context.get("context_count_per_payload"), arm.contexts_per_payload,
+         "context_selection.context_count_per_payload"),
+        (context.get("total_context_rows"),
+         arm.contexts_per_payload * len(CARRIED_FORWARD_PAYLOAD_IDS),
+         "context_selection.total_context_rows"),
+        (budget.get("max_mutations_per_payload"),
+         arm.max_mutations_per_payload,
+         "iteration_budget.max_mutations_per_payload"),
+        (budget.get("max_total_mutation_attempts"), arm.max_total_mutations,
+         "iteration_budget.max_total_mutation_attempts"),
+        (models.get("proposer_model"), arm.proposer_model,
+         "models.proposer_model"),
+        (models.get("target_model"), arm.target_model, "models.target_model"),
+        (quota.get("guard"),
+         "MultiQuotaGuard" if arm.dual_quota else "QuotaGuard",
+         "quota.guard"),
+    )
+    for actual, expected, field in semantic_values:
+        _require_frozen_value(
+            actual, expected, field=field, design_path=design_path
+        )
+
+    expected_output_root = f"data/adaptive/g4/{arm.arm_id}"
+    expected_outputs = {
+        "root": expected_output_root,
+        "attempts": f"{expected_output_root}/attempts.jsonl",
+        "summary": f"{expected_output_root}/loop_summary.json",
+        "raw_traces": f"{expected_output_root}/results/raw",
+    }
+    for field, expected in expected_outputs.items():
+        _require_frozen_value(
+            outputs.get(field),
+            expected,
+            field=f"outputs.{field}",
+            design_path=design_path,
+        )
+
+    sources = manifest.get("source_artifacts")
+    if not isinstance(sources, dict):
+        raise ValueError(f"{design_path}: source_artifacts must be an object")
+    source_checks = (
+        (
+            "strategy_manifest_path",
+            "strategy_manifest_sha256_canonical_lf",
+            "data/adaptive/g4/v1/strategy_manifest.json",
+            STRATEGY_MANIFEST_PATH,
+            _canonical_lf_sha256,
+        ),
+        (
+            "eligible_case_manifest_path",
+            "eligible_case_manifest_sha256_canonical_lf",
+            "data/adaptive/g4/v1/eligible_stopped_cases.tsv",
+            ELIGIBLE_CASES_PATH,
+            _canonical_lf_sha256,
+        ),
+        (
+            "context_manifest_path",
+            "context_manifest_sha256_canonical_lf",
+            "data/adaptive/g4/v2_context_manifest.tsv",
+            V2_CONTEXT_MANIFEST_PATH,
+            _canonical_lf_sha256,
+        ),
+        (
+            "defense_freeze_path",
+            "defense_freeze_sha256",
+            "data/defended/g4/v1/defense_freeze.json",
+            DEFENSE_FREEZE_PATH,
+            _raw_sha256,
+        ),
+        (
+            "defense_source_path",
+            "defense_source_sha256_canonical_lf",
+            "src/defenses/my_spotlighting.py",
+            PROJECT_ROOT / "src" / "defenses" / "my_spotlighting.py",
+            _canonical_lf_sha256,
+        ),
+    )
+    for path_field, hash_field, expected_relative, actual_path, hasher in source_checks:
+        _require_frozen_value(
+            sources.get(path_field),
+            expected_relative,
+            field=f"source_artifacts.{path_field}",
+            design_path=design_path,
+        )
+        recorded_hash = sources.get(hash_field)
+        actual_hash = hasher(actual_path)
+        if recorded_hash != actual_hash:
+            raise ValueError(
+                f"{design_path}: source hash mismatch for {actual_path}: "
+                f"recorded {recorded_hash!r}, current {actual_hash!r}"
+            )
+
+    return manifest
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +921,314 @@ def build_loop_summary_from_checkpoint(
         ),
         "payloads": payloads,
     }
+
+
+def _checkpoint_key(record: dict[str, Any]) -> tuple[str, ...]:
+    key = tuple(record.get(field) for field in ATTEMPT_KEY_FIELDS)
+    if not all(isinstance(value, str) and value for value in key):
+        raise ValueError("checkpoint row has an incomplete attempt key")
+    return cast(tuple[str, ...], key)
+
+
+def load_v2_checkpoint_state(
+    *,
+    arm: ArmSpec,
+    planned_attempts: list[PlannedAttempt],
+    attempts_path: Path,
+    defense_sha256: str,
+) -> V2CheckpointState:
+    """Validate and reconstruct all state needed for exact v2 resume.
+
+    A completed target verdict and a malformed/truncated proposer generation
+    each consume their predeclared mutation round. Target/proposer quota errors
+    remain retryable. If proposal generation succeeded before a target error,
+    the accepted template is retained for target-only retry so no duplicate
+    proposer request is made.
+    """
+    if arm.arm_id == "v1":
+        raise ValueError("load_v2_checkpoint_state is only valid for v2 arms")
+
+    planned_by_key = {
+        item.attempt_key.key_tuple: item for item in planned_attempts
+    }
+    if len(planned_by_key) != len(planned_attempts):
+        raise ValueError("v2 plan contains duplicate attempt keys")
+
+    terminal: dict[tuple[str, ...], dict[str, Any]] = {}
+    completed: dict[tuple[str, ...], dict[str, Any]] = {}
+    retry_templates: dict[tuple[str, ...], str] = {}
+    retry_keys: set[tuple[str, ...]] = set()
+
+    if attempts_path.exists():
+        for line_no, line in enumerate(
+            attempts_path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Malformed JSON in {attempts_path}:{line_no}: {exc}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"{attempts_path}:{line_no}: checkpoint row must be an object"
+                )
+            try:
+                key = _checkpoint_key(record)
+            except ValueError as exc:
+                raise ValueError(f"{attempts_path}:{line_no}: {exc}") from exc
+            planned = planned_by_key.get(key)
+            if planned is None:
+                raise ValueError(
+                    f"{attempts_path}:{line_no}: attempt key is not in the "
+                    f"frozen {arm.arm_id} plan: {key}"
+                )
+
+            expected_values = {
+                "schema_version": 1,
+                "attempt_id": planned.attempt_key.attempt_id(),
+                "adaptive_attack_version": arm.adaptive_version,
+                "domain": planned.case.domain,
+                "channel": planned.case.channel,
+                "mutation_round": planned.mutation_round,
+                "proposer_model": arm.proposer_model,
+                "target_model": arm.target_model,
+                "defense": MY_SPOTLIGHTING,
+                "defense_version": MY_SPOTLIGHTING_VERSION,
+                "defense_sha256": defense_sha256,
+            }
+            for field, expected in expected_values.items():
+                if record.get(field) != expected:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: {field} mismatch for "
+                        f"{planned.attempt_key.attempt_id()}: expected "
+                        f"{expected!r}, got {record.get(field)!r}"
+                    )
+
+            proposer_requests = record.get("proposer_requests")
+            if (
+                isinstance(proposer_requests, bool)
+                or not isinstance(proposer_requests, int)
+                or proposer_requests < 0
+            ):
+                raise ValueError(
+                    f"{attempts_path}:{line_no}: proposer_requests must be "
+                    "a nonnegative integer"
+                )
+
+            template = record.get("mutated_template")
+            template_hash = record.get("mutated_template_sha256")
+            if template is None:
+                if template_hash is not None:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: null template must have "
+                        "a null hash"
+                    )
+            elif not isinstance(template, str) or not template:
+                raise ValueError(
+                    f"{attempts_path}:{line_no}: mutated_template must be a "
+                    "nonempty string or null"
+                )
+            elif template_hash != hashlib.sha256(
+                template.encode("utf-8")
+            ).hexdigest():
+                raise ValueError(
+                    f"{attempts_path}:{line_no}: mutated template hash mismatch"
+                )
+
+            status = record.get("status")
+            proposer_status = record.get("proposer_status")
+            if status == "completed":
+                if (
+                    proposer_status != "accepted"
+                    or not isinstance(template, str)
+                    or not isinstance(record.get("attack_success"), bool)
+                ):
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: invalid completed row"
+                    )
+                if key in terminal:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: duplicate terminal row "
+                        f"for attempt {record['attempt_id']}"
+                    )
+                terminal[key] = record
+                completed[key] = record
+                retry_templates.pop(key, None)
+                retry_keys.discard(key)
+            elif status == "skipped" and proposer_status == "malformed":
+                if template is not None or record.get("attack_success") is not None:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: invalid malformed row"
+                    )
+                if key in terminal:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: duplicate terminal row "
+                        f"for attempt {record['attempt_id']}"
+                    )
+                terminal[key] = record
+                retry_templates.pop(key, None)
+                retry_keys.discard(key)
+            elif status == "truncated" and proposer_status == "truncated":
+                if template is not None or record.get("attack_success") is not None:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: invalid truncated row"
+                    )
+                if key in terminal:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: duplicate terminal row "
+                        f"for attempt {record['attempt_id']}"
+                    )
+                terminal[key] = record
+                retry_templates.pop(key, None)
+                retry_keys.discard(key)
+            elif status == "error":
+                if key in terminal:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: retry row follows a "
+                        f"terminal row for attempt {record['attempt_id']}"
+                    )
+                if proposer_status == "accepted" and isinstance(template, str):
+                    retry_templates[key] = template
+                elif proposer_status == "quota_stop" and template is None:
+                    retry_templates.pop(key, None)
+                else:
+                    raise ValueError(
+                        f"{attempts_path}:{line_no}: invalid retryable error row"
+                    )
+                retry_keys.add(key)
+            else:
+                raise ValueError(
+                    f"{attempts_path}:{line_no}: unsupported status/proposer_status "
+                    f"combination {status!r}/{proposer_status!r}"
+                )
+
+    terminal_by_payload: dict[str, list[tuple[PlannedAttempt, dict[str, Any]]]] = {}
+    for key, record in terminal.items():
+        planned = planned_by_key[key]
+        terminal_by_payload.setdefault(key[0], []).append((planned, record))
+
+    payload_attempt_counts: dict[str, int] = {}
+    payload_succeeded: set[str] = set()
+    for payload_id in CARRIED_FORWARD_PAYLOAD_IDS:
+        rows = sorted(
+            terminal_by_payload.get(payload_id, []),
+            key=lambda item: item[0].mutation_round,
+        )
+        rounds = [item[0].mutation_round for item in rows]
+        if rounds != list(range(1, len(rounds) + 1)):
+            raise ValueError(
+                f"{attempts_path}: consumed rounds for {payload_id!r} must "
+                f"form a contiguous prefix; got {rounds}"
+            )
+        if len(rounds) > arm.max_mutations_per_payload:
+            raise ValueError(
+                f"{attempts_path}: {payload_id!r} exceeds its frozen "
+                f"{arm.max_mutations_per_payload}-round budget"
+            )
+        successes = [
+            item[0].mutation_round
+            for item in rows
+            if item[1].get("attack_success") is True
+        ]
+        if len(successes) > 1 or (successes and successes[0] != rounds[-1]):
+            raise ValueError(
+                f"{attempts_path}: terminal rows violate first-success stop "
+                f"for {payload_id!r}"
+            )
+        if successes:
+            payload_succeeded.add(payload_id)
+        payload_attempt_counts[payload_id] = len(rows)
+
+        retry_rounds = {
+            planned_by_key[key].mutation_round
+            for key in retry_keys
+            if key[0] == payload_id
+        }
+        if retry_rounds and (
+            payload_id in payload_succeeded
+            or retry_rounds != {len(rows) + 1}
+        ):
+            raise ValueError(
+                f"{attempts_path}: retry rows for {payload_id!r} must refer "
+                "only to the next unconsumed round"
+            )
+
+    if len(terminal) > arm.max_total_mutations:
+        raise ValueError(
+            f"{attempts_path}: checkpoint exceeds the frozen "
+            f"{arm.max_total_mutations}-attempt arm budget"
+        )
+
+    prior_by_payload: dict[str, list[dict[str, Any]]] = {
+        payload_id: [] for payload_id in CARRIED_FORWARD_PAYLOAD_IDS
+    }
+    for planned in planned_attempts:
+        record = completed.get(planned.attempt_key.key_tuple)
+        if record is not None:
+            prior_by_payload[planned.attempt_key.payload_id].append(
+                {
+                    "strategy_id": planned.strategy_id,
+                    "mutated_template": record["mutated_template"],
+                    "attack_success": record["attack_success"],
+                }
+            )
+
+    return V2CheckpointState(
+        terminal_records=terminal,
+        completed_records=completed,
+        payload_succeeded=payload_succeeded,
+        payload_attempt_counts=payload_attempt_counts,
+        prior_by_payload=prior_by_payload,
+        retry_templates=retry_templates,
+    )
+
+
+def build_v2_loop_summary(state: V2CheckpointState) -> dict[str, Any]:
+    """Summarize consumed v2 mutation rounds, including proposer failures."""
+    payloads: dict[str, dict[str, Any]] = {}
+    for payload_id in CARRIED_FORWARD_PAYLOAD_IDS:
+        attempts = state.payload_attempt_counts.get(payload_id, 0)
+        if attempts:
+            payloads[payload_id] = {
+                "attempts": attempts,
+                "success": payload_id in state.payload_succeeded,
+            }
+    return {
+        "total_attempts": len(state.terminal_records),
+        "total_successes": sum(
+            1
+            for record in state.completed_records.values()
+            if record["attack_success"]
+        ),
+        "payloads": payloads,
+    }
+
+
+def _proposer_attempt_count(proposer_llm: Any) -> int | None:
+    limiter = getattr(proposer_llm, "_rate_limiter", None)
+    count = getattr(limiter, "requests_started", None)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
+def _proposer_attempt_delta(
+    proposer_llm: Any,
+    before: int | None,
+    *,
+    fallback: int,
+) -> int:
+    after = _proposer_attempt_count(proposer_llm)
+    if before is None or after is None:
+        return fallback
+    delta = after - before
+    if delta < 0:
+        raise ValueError("proposer request-attempt counter decreased")
+    return delta
 
 
 def append_attempt_record(
@@ -1292,6 +1814,9 @@ def run_adaptive_loop(
     raw_root = arm_raw_traces_root(arm)
     summary_path = arm_summary_path(arm)
 
+    if arm.arm_id != "v1":
+        verify_v2_design_freeze(arm)
+
     eligible_cases = load_eligible_cases()
     corpus = load_corpus()
     strategy_descriptions = load_strategy_descriptions()
@@ -1301,14 +1826,27 @@ def run_adaptive_loop(
     if arm.contexts_per_payload > 1:
         context_map = load_v2_contexts(eligible_cases)
 
-    planned = plan_attempts(
+    all_planned = plan_attempts(
         eligible_cases,
         corpus,
         strategy_descriptions,
-        payload_filter=payload_filter,
+        payload_filter=None if arm.arm_id != "v1" else payload_filter,
         arm_id=arm.arm_id,
         context_map=context_map,
     )
+    if arm.arm_id != "v1" and payload_filter is not None:
+        if payload_filter not in CARRIED_FORWARD_PAYLOAD_IDS:
+            raise ValueError(
+                f"Unknown payload {payload_filter!r}; must be one of "
+                f"{CARRIED_FORWARD_PAYLOAD_IDS}"
+            )
+        planned = [
+            item
+            for item in all_planned
+            if item.attempt_key.payload_id == payload_filter
+        ]
+    else:
+        planned = all_planned
 
     if dry_run:
         print(f"Planned {len(planned)} attempts (dry run — no API calls):")
@@ -1321,10 +1859,31 @@ def run_adaptive_loop(
             )
         return {"dry_run": True, "planned_count": len(planned)}
 
-    # Load checkpoint state (this arm's file only; other arms are untouched)
-    completed_keys = load_completed_attempts(attempts_path)
-    payload_succeeded = load_payload_successes(attempts_path)
-    payload_attempt_counts = count_payload_attempts_in_checkpoint(attempts_path)
+    # Load checkpoint state (this arm's file only; other arms are untouched).
+    # v1 retains its historical resume rules. v2 validates full provenance,
+    # counts malformed/truncated proposer generations as consumed rounds, and
+    # reconstructs the prior-verdict feedback supplied to later proposals.
+    v2_state: V2CheckpointState | None = None
+    retry_templates: dict[tuple[str, ...], str] = {}
+    if arm.arm_id == "v1":
+        completed_keys = load_completed_attempts(attempts_path)
+        payload_succeeded = load_payload_successes(attempts_path)
+        payload_attempt_counts = count_payload_attempts_in_checkpoint(attempts_path)
+        prior_by_payload: dict[str, list[dict[str, Any]]] = {
+            pid: [] for pid in CARRIED_FORWARD_PAYLOAD_IDS
+        }
+    else:
+        v2_state = load_v2_checkpoint_state(
+            arm=arm,
+            planned_attempts=all_planned,
+            attempts_path=attempts_path,
+            defense_sha256=expected_defense_sha256,
+        )
+        completed_keys = set(v2_state.terminal_records)
+        payload_succeeded = set(v2_state.payload_succeeded)
+        payload_attempt_counts = dict(v2_state.payload_attempt_counts)
+        prior_by_payload = v2_state.prior_by_payload
+        retry_templates = dict(v2_state.retry_templates)
 
     # Build the proposer LLM (direct generate_content, no tool pipeline)
     if proposer_llm is None:
@@ -1333,11 +1892,6 @@ def run_adaptive_loop(
             proposer_llm = get_google_primary_llm(rate_limiter=dedicated_limiter)
         else:
             proposer_llm = get_google_gemma4_26b_llm()
-
-    # Maintain per-payload prior-attempt feedback for the proposer
-    prior_by_payload: dict[str, list[dict[str, Any]]] = {
-        pid: [] for pid in CARRIED_FORWARD_PAYLOAD_IDS
-    }
 
     new_attempts = 0
 
@@ -1400,23 +1954,45 @@ def run_adaptive_loop(
         proposer_error: str | None = None
         proposer_finish_reason: str | None = None
         proposer_status = "pending"
-        injection_goal = get_injection_goal(case)
+        retry_template = retry_templates.get(attempt_key.key_tuple)
+        if retry_template is not None:
+            mutated_template = retry_template
+            logging.info(
+                "Resuming target-only retry for attempt %s with the "
+                "checkpointed accepted proposal",
+                attempt_id[:12],
+            )
+        proposer_attempts_before = (
+            _proposer_attempt_count(proposer_llm)
+            if arm.arm_id != "v1" and mutated_template is None
+            else None
+        )
+        injection_goal = (
+            get_injection_goal(case) if mutated_template is None else ""
+        )
 
         try:
-            mutated_template, proposer_requests = propose_mutation(
-                strategy_id=planned_attempt.strategy_id,
-                strategy_description=planned_attempt.strategy_description,
-                original_template=planned_attempt.payload.template,
-                injection_goal=injection_goal,
-                prior_attempts=prior_by_payload[pid],
-                proposer_llm=proposer_llm,
-            )
+            if mutated_template is None:
+                mutated_template, proposer_requests = propose_mutation(
+                    strategy_id=planned_attempt.strategy_id,
+                    strategy_description=planned_attempt.strategy_description,
+                    original_template=planned_attempt.payload.template,
+                    injection_goal=injection_goal,
+                    prior_attempts=prior_by_payload[pid],
+                    proposer_llm=proposer_llm,
+                )
             proposer_status = "accepted"
         except ProposerTruncatedError as exc:
             proposer_error = str(exc)
             proposer_finish_reason = exc.finish_reason
             proposer_status = "truncated"
-            proposer_requests = 1
+            proposer_requests = (
+                1
+                if arm.arm_id == "v1"
+                else _proposer_attempt_delta(
+                    proposer_llm, proposer_attempts_before, fallback=1
+                )
+            )
             logging.warning(
                 "Proposer truncated before final output for attempt %s: %s",
                 attempt_id[:12],
@@ -1425,13 +2001,23 @@ def run_adaptive_loop(
         except ValueError as exc:
             proposer_error = str(exc)
             proposer_status = "malformed"
-            proposer_requests = 1  # one API call was made before validation failed
+            proposer_requests = (
+                1
+                if arm.arm_id == "v1"
+                else _proposer_attempt_delta(
+                    proposer_llm, proposer_attempts_before, fallback=1
+                )
+            )
             logging.warning(
                 "Proposer malformed output for attempt %s: %s",
                 attempt_id[:12],
                 proposer_error,
             )
         except (RequestBudgetExceeded, ClientError) as exc:
+            if arm.arm_id != "v1":
+                proposer_requests = _proposer_attempt_delta(
+                    proposer_llm, proposer_attempts_before, fallback=0
+                )
             # Quota stop — checkpoint and re-raise
             record = _build_attempt_record(
                 attempt_id=attempt_id,
@@ -1473,13 +2059,15 @@ def run_adaptive_loop(
             )
             append_attempt_record(record, attempts_path)
             new_attempts += 1
-            # Preserve the failed generation without making the round terminal.
+            # The generated round is consumed even though no target call ran.
+            completed_keys.add(attempt_key.key_tuple)
             payload_attempt_counts[pid] = payload_attempt_counts.get(pid, 0) + 1
             continue
 
         # --- Target ---
         target_result: dict[str, Any] | None = None
         target_error: str | None = None
+        target_exception: Exception | None = None
         final_status = "pending"
 
         try:
@@ -1514,6 +2102,7 @@ def run_adaptive_loop(
             append_attempt_record(record, attempts_path)
             raise
         except Exception as exc:
+            target_exception = exc
             target_error = str(exc)
             final_status = "error"
             logging.error(
@@ -1544,6 +2133,12 @@ def run_adaptive_loop(
         if final_status == "completed":
             completed_keys.add(attempt_key.key_tuple)
         payload_attempt_counts[pid] = payload_attempt_counts.get(pid, 0) + 1
+
+        # v2 is strictly sequential: a retryable target failure must be
+        # resolved before any later round can consume budget or feedback.
+        # Preserve v1's historical behavior of checkpointing and continuing.
+        if target_exception is not None and arm.arm_id != "v1":
+            raise target_exception
 
         # Update prior-attempt feedback (only development feedback — no held-out)
         if final_status == "completed":
@@ -1581,8 +2176,19 @@ def run_adaptive_loop(
                 outcome,
             )
 
-    # Write summary artifact
-    summary = build_loop_summary_from_checkpoint(attempts_path)
+    # Write summary artifact. v2 counts every consumed mutation round,
+    # including malformed/truncated proposer generations; v1 retains its
+    # historical completed-target-only summary semantics.
+    if arm.arm_id == "v1":
+        summary = build_loop_summary_from_checkpoint(attempts_path)
+    else:
+        final_v2_state = load_v2_checkpoint_state(
+            arm=arm,
+            planned_attempts=all_planned,
+            attempts_path=attempts_path,
+            defense_sha256=expected_defense_sha256,
+        )
+        summary = build_v2_loop_summary(final_v2_state)
     atomic_write_json(summary_path, summary)
     return summary
 
@@ -1697,6 +2303,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"(round {p.mutation_round})"
             )
         return 0
+
+    if arm.arm_id != "v1":
+        try:
+            verify_v2_design_freeze(arm)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(
+                f"ERROR: {arm.arm_id} design-freeze verification failed: {exc}",
+                file=sys.stderr,
+            )
+            return 1
 
     # Verify defense hash before any API call
     current_sha = defense_source_sha256()

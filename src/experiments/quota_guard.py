@@ -456,7 +456,17 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
 
         try:
             records = _read_ledger(self.ledger_path)
-            record = self._plan_reservation(records, self._now_utc())
+            records_before_plan = [dict(record) for record in records]
+            try:
+                record = self._plan_reservation(records, self._now_utc())
+            except BaseException:
+                # A fresh dashboard observation safely resolves abandoned
+                # reservations even when it also proves that no new positive
+                # budget remains. Persist those resolutions without creating
+                # a new reservation.
+                if records != records_before_plan:
+                    _write_ledger_atomic(self.ledger_path, records)
+                raise
             records.append(record)
             _write_ledger_atomic(self.ledger_path, records)
             self._commit_reservation(len(records) - 1)
@@ -656,10 +666,22 @@ class MultiQuotaGuard(AbstractContextManager["MultiQuotaGuard"]):
 
         try:
             records = _read_ledger(first.ledger_path)
+            records_before_plan = [dict(record) for record in records]
             current = first._now_utc()
             # Plan every key before writing anything: if any key cannot
             # reserve (invalid inputs, exhausted budget), no key reserves.
-            planned = [guard._plan_reservation(records, current) for guard in self._guards]
+            try:
+                planned = [
+                    guard._plan_reservation(records, current)
+                    for guard in self._guards
+                ]
+            except BaseException:
+                # Resolution of abandoned reservations is independent from
+                # the all-or-nothing rule for *new* multi-key reservations.
+                # Keep the fresh observations even if one key cannot reserve.
+                if records != records_before_plan:
+                    _write_ledger_atomic(first.ledger_path, records)
+                raise
             first_index = len(records)
             records.extend(planned)
             _write_ledger_atomic(first.ledger_path, records)

@@ -279,6 +279,23 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertIsNotNone(resolved[0]["interruption_resolved_at"])
         self.assertEqual(37, resolved[0]["resolution_dashboard_used"])
 
+    def test_exhausted_fresh_observation_still_persists_interruption_resolution(
+        self,
+    ) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            with self.guard(dashboard_used=0, max_api_requests=100):
+                self.attempts.count += 1
+                raise KeyboardInterrupt
+
+        with self.assertRaisesRegex(QuotaValidationError, "No positive"):
+            with self.guard(dashboard_used=475, max_api_requests=100):
+                pass
+
+        records = _records(self.ledger)
+        self.assertEqual(1, len(records), "no new reservation may be appended")
+        self.assertIsNotNone(records[0]["interruption_resolved_at"])
+        self.assertEqual(475, records[0]["resolution_dashboard_used"])
+
     def test_zero_attempt_exception_reconciles_without_stranding_reservation(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "validation failed"):
             with self.guard(dashboard_used=30, max_api_requests=100):
@@ -548,6 +565,37 @@ class MultiQuotaGuardTests(unittest.TestCase):
         self.assertEqual(4, len(records))
         resolved = [r for r in records if r["interruption_resolved_at"] is not None]
         self.assertEqual(2, len(resolved))
+
+    def test_failed_multi_reservation_persists_resolutions_for_both_keys(
+        self,
+    ) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        with self.assertRaises(Boom):
+            with MultiQuotaGuard(
+                [self.proposer_guard(), self.target_guard()]
+            ):
+                self.proposer_attempts.count += 1
+                self.target_attempts.count += 1
+                raise Boom
+
+        with self.assertRaisesRegex(QuotaValidationError, "No positive"):
+            with MultiQuotaGuard(
+                [
+                    self.proposer_guard(dashboard_used=1),
+                    self.target_guard(
+                        dashboard_used=GEMMA4_26B_RPD_LIMIT - 25
+                    ),
+                ]
+            ):
+                pass
+
+        records = _records(self.ledger)
+        self.assertEqual(2, len(records), "new reservations are all-or-nothing")
+        self.assertTrue(
+            all(record["interruption_resolved_at"] is not None for record in records)
+        )
 
     def test_exception_with_zero_attempts_on_one_key_reconciles_only_it(self) -> None:
         class Boom(RuntimeError):
