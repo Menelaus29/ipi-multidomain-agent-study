@@ -14,28 +14,44 @@ to the documented methodology and should not be intentionally weakened.
 
 ---
 
-Phase 10 adaptive attack loop.
+Phase 10/11 adaptive attack loop.
 
 Given the frozen ``my_spotlighting`` v1 defense mechanism, this loop applies
-each of the five mutation strategies from the committed strategy manifest to
-the five carried-forward payloads, cycling through their eligible stopped
-cases until either a native AgentDojo success is observed or the per-payload
-budget of five mutations is exhausted.
+the five mutation strategies from the committed strategy manifest to the five
+carried-forward payloads until either a native AgentDojo success is observed
+or the per-payload mutation budget is exhausted.
 
-Both the proposer (generating the mutated template) and the target (running
-the benchmark with the frozen defense) use ``gemma-4-26b-a4b-it`` via the
-existing ``get_google_gemma4_26b_llm()`` factory. This preserves model
-consistency with all Phase 9 artifacts.
+Arms
+----
+``v1`` (complete, immutable): five mutations per payload against one fixed
+case (the first eligible case in manifest order), Gemma proposer and target.
+
+``v2a``: predeclared expansion — twenty mutations per payload across four
+contexts per payload (context 1 is the v1 fixed case; contexts 2-4 are the
+next three rows in committed eligible-manifest order, frozen in
+``data/adaptive/g4/v2_context_manifest.tsv``). Round ``r`` uses strategy
+``STRATEGY_IDS[(r - 1) // 4]`` and context ``ctx[(r - 1) % 4]``. Gemma
+proposer and target, exactly as v1/Phase 10.6.
+
+``v2b``: clearly labeled ablation — identical budget, contexts, strategies,
+defense, and Gemma target as v2a, but the proposer is
+``gemini-3.5-flash-lite`` via ``get_google_primary_llm()`` on a dedicated
+request limiter. v2b therefore meters two quota keys in one process
+(MultiQuotaGuard) and its results are never pooled with v2a.
+
+v1 artifacts under ``data/adaptive/g4/v1/`` are never read or written by the
+v2 arms; each arm checkpoints only to its own versioned root.
 
 Usage
 -----
 Plan mode (no API calls)::
 
     python -m src.adaptive.adaptive_loop --plan
+    python -m src.adaptive.adaptive_loop --plan --arm v2a
 
 Run against all payloads (requires quota arguments)::
 
-    python -m src.adaptive.adaptive_loop \\
+    python -m src.adaptive.adaptive_loop --arm v2a \\
         --quota-date YYYY-MM-DD \\
         --dashboard-used N \\
         --dashboard-limit N \\
@@ -43,11 +59,20 @@ Run against all payloads (requires quota arguments)::
 
 Run against one payload::
 
-    python -m src.adaptive.adaptive_loop --payload persona-04 \\
+    python -m src.adaptive.adaptive_loop --arm v2a --payload persona-04 \\
         --quota-date YYYY-MM-DD \\
         --dashboard-used N \\
         --dashboard-limit N \\
         --max-api-requests N
+
+v2b additionally requires a fresh Gemini 3.5 Flash-Lite dashboard reading and
+its own cap for the proposer key::
+
+    python -m src.adaptive.adaptive_loop --arm v2b \\
+        --quota-date YYYY-MM-DD \\
+        --dashboard-used N --dashboard-limit N --max-api-requests N \\
+        --proposer-dashboard-used N --proposer-dashboard-limit N \\
+        --proposer-max-api-requests N
 """
 
 from __future__ import annotations
@@ -85,12 +110,22 @@ from src.defenses.my_spotlighting import (
     defense_source_sha256,
 )
 from src.experiments.operation_journal import atomic_write_json
-from src.experiments.quota_guard import add_quota_arguments, quota_guard_from_args
+from src.experiments.quota_guard import (
+    MultiQuotaGuard,
+    QuotaGuard,
+    add_quota_arguments,
+    quota_guard_from_args,
+)
 from src.llm_providers.google_llm_factory import (
     GEMMA4_26B_MODEL,
     GEMMA4_26B_PIPELINE_NAME,
+    MIN_REQUEST_INTERVAL_SECONDS,
+    PRIMARY_MODEL,
+    PRIMARY_RPD_LIMIT,
     RequestBudgetExceeded,
+    RequestRateLimiter,
     get_google_gemma4_26b_llm,
+    get_google_primary_llm,
     get_google_request_attempt_count,
 )
 from src.schemas import PayloadEntry, SchemaValidationError
@@ -116,6 +151,33 @@ ADAPTIVE_VERSION = "v1"
 # Frozen budget per task 10.5
 MAX_MUTATIONS_PER_PAYLOAD = 5
 MAX_TOTAL_MUTATIONS = 25  # 5 payloads × 5
+
+# ---------------------------------------------------------------------------
+# v2 arms (predeclared in data/adaptive/g4/v2{a,b}/design_freeze.json before
+# any v2 API call; see docs/decisions_log.md "Versioned v2 adaptive-search
+# budget")
+# ---------------------------------------------------------------------------
+
+V2A_ROOT = PROJECT_ROOT / "data" / "adaptive" / "g4" / "v2a"
+V2B_ROOT = PROJECT_ROOT / "data" / "adaptive" / "g4" / "v2b"
+V2_CONTEXT_MANIFEST_PATH = (
+    PROJECT_ROOT / "data" / "adaptive" / "g4" / "v2_context_manifest.tsv"
+)
+
+V2_MAX_MUTATIONS_PER_PAYLOAD = 20
+V2_MAX_TOTAL_MUTATIONS = 100  # 5 payloads × 20
+V2_CONTEXTS_PER_PAYLOAD = 4
+
+V2_CONTEXT_FIELDS = (
+    "payload_id",
+    "context_index",
+    "domain",
+    "channel",
+    "injection_vector",
+    "user_task_id",
+    "injection_task_id",
+    "source_manifest_row",
+)
 
 # Canonical payload order from strategy_manifest.json
 CARRIED_FORWARD_PAYLOAD_IDS: tuple[str, ...] = (
@@ -161,6 +223,100 @@ PROPOSER_MAX_OUTPUT_TOKENS = 4096
 PROPOSER_THINKING_LEVEL = "minimal"
 
 _UNRESOLVED_TOKEN_RE = re.compile(r"\{\{[^{}]+\}\}")
+
+# ---------------------------------------------------------------------------
+# Arm configuration (v1 default preserved; v2a/v2b per frozen design manifests)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ArmSpec:
+    """Static configuration of one adaptive-search arm.
+
+    Paths are resolved per call through the ``arm_*`` helpers so the v1 arm
+    continues to honor the module-level path constants, and v2 arms derive
+    everything from their fixed versioned roots.
+    """
+
+    arm_id: str
+    adaptive_version: str
+    max_mutations_per_payload: int
+    max_total_mutations: int
+    contexts_per_payload: int  # 1 = v1 fixed case; 4 = v2 context rotation
+    proposer_model: str
+    target_model: str
+    dual_quota: bool  # v2b: Gemini proposer key + Gemma target key
+
+
+ARMS: dict[str, ArmSpec] = {
+    "v1": ArmSpec(
+        arm_id="v1",
+        adaptive_version=ADAPTIVE_VERSION,
+        max_mutations_per_payload=MAX_MUTATIONS_PER_PAYLOAD,
+        max_total_mutations=MAX_TOTAL_MUTATIONS,
+        contexts_per_payload=1,
+        proposer_model=GEMMA4_26B_MODEL,
+        target_model=GEMMA4_26B_MODEL,
+        dual_quota=False,
+    ),
+    "v2a": ArmSpec(
+        arm_id="v2a",
+        adaptive_version="v2a",
+        max_mutations_per_payload=V2_MAX_MUTATIONS_PER_PAYLOAD,
+        max_total_mutations=V2_MAX_TOTAL_MUTATIONS,
+        contexts_per_payload=V2_CONTEXTS_PER_PAYLOAD,
+        proposer_model=GEMMA4_26B_MODEL,
+        target_model=GEMMA4_26B_MODEL,
+        dual_quota=False,
+    ),
+    "v2b": ArmSpec(
+        arm_id="v2b",
+        adaptive_version="v2b",
+        max_mutations_per_payload=V2_MAX_MUTATIONS_PER_PAYLOAD,
+        max_total_mutations=V2_MAX_TOTAL_MUTATIONS,
+        contexts_per_payload=V2_CONTEXTS_PER_PAYLOAD,
+        proposer_model=PRIMARY_MODEL,
+        target_model=GEMMA4_26B_MODEL,
+        dual_quota=True,
+    ),
+}
+
+
+def resolve_arm(arm_id: str) -> ArmSpec:
+    """Return the frozen configuration for one arm ID."""
+    try:
+        return ARMS[arm_id]
+    except KeyError:
+        raise ValueError(
+            f"Unknown arm {arm_id!r}; must be one of {tuple(ARMS)}"
+        ) from None
+
+
+def arm_root(arm: ArmSpec) -> Path:
+    """Versioned output root for one arm (read at call time)."""
+    if arm.arm_id == "v1":
+        return ADAPTIVE_ROOT
+    if arm.arm_id == "v2a":
+        return V2A_ROOT
+    return V2B_ROOT
+
+
+def arm_attempts_path(arm: ArmSpec) -> Path:
+    """Checkpoint file for one arm (read at call time)."""
+    if arm.arm_id == "v1":
+        return ATTEMPTS_JSONL_PATH
+    return arm_root(arm) / "attempts.jsonl"
+
+
+def arm_summary_path(arm: ArmSpec) -> Path:
+    return arm_root(arm) / "loop_summary.json"
+
+
+def arm_raw_traces_root(arm: ArmSpec) -> Path:
+    if arm.arm_id == "v1":
+        return RAW_TRACES_ROOT
+    return arm_root(arm) / "results" / "raw"
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -268,6 +424,112 @@ def load_eligible_cases() -> list[EligibleCase]:
     return cases
 
 
+def load_v2_contexts(
+    eligible_cases: list[EligibleCase],
+    *,
+    manifest_path: Path | None = None,
+) -> dict[str, list[EligibleCase]]:
+    """Load and validate the committed v2 context manifest.
+
+    The frozen selection rule (design_freeze.json, both v2 arms) is: for each
+    payload, the first four rows of ``eligible_stopped_cases.tsv`` in
+    committed manifest order, context 1 being the v1 fixed case. This loader
+    enforces that rule against the committed manifests and fails closed on
+    any mismatch:
+
+    - exact column header;
+    - exactly the five carried-forward payloads;
+    - ``context_index`` 1..V2_CONTEXTS_PER_PAYLOAD exactly once per payload;
+    - every row equals its cited 1-based ``source_manifest_row`` in the
+      committed eligible manifest on all six case fields;
+    - context 1 equals the first eligible case for its payload;
+    - all full case keys distinct.
+    """
+    path = manifest_path if manifest_path is not None else V2_CONTEXT_MANIFEST_PATH
+    rows: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        header = tuple(reader.fieldnames or ())
+        if header != V2_CONTEXT_FIELDS:
+            raise ValueError(f"Unexpected columns in {path}: {header}")
+        rows.extend(reader)
+
+    first_eligible_by_payload: dict[str, EligibleCase] = {}
+    for case in eligible_cases:
+        first_eligible_by_payload.setdefault(case.payload_id, case)
+
+    by_payload: dict[str, dict[int, EligibleCase]] = {}
+    seen_keys: set[tuple[str, ...]] = set()
+    for row in rows:
+        payload_id = row["payload_id"]
+        if payload_id not in CARRIED_FORWARD_PAYLOAD_IDS:
+            raise ValueError(
+                f"{path}: payload {payload_id!r} is not a carried-forward payload"
+            )
+        try:
+            context_index = int(row["context_index"])
+            source_row = int(row["source_manifest_row"])
+        except ValueError as exc:
+            raise ValueError(
+                f"{path}: non-integer context_index/source_manifest_row: {row}"
+            ) from exc
+        if not 1 <= context_index <= V2_CONTEXTS_PER_PAYLOAD:
+            raise ValueError(
+                f"{path}: context_index {context_index} outside "
+                f"1..{V2_CONTEXTS_PER_PAYLOAD}"
+            )
+        if not 1 <= source_row <= len(eligible_cases):
+            raise ValueError(
+                f"{path}: source_manifest_row {source_row} outside the "
+                f"eligible manifest (1..{len(eligible_cases)})"
+            )
+        source = eligible_cases[source_row - 1]
+        case = EligibleCase(
+            payload_id=row["payload_id"],
+            domain=row["domain"],
+            channel=row["channel"],
+            injection_vector=row["injection_vector"],
+            user_task_id=row["user_task_id"],
+            injection_task_id=row["injection_task_id"],
+        )
+        if case.key != source.key:
+            raise ValueError(
+                f"{path}: context row for {payload_id} context {context_index} "
+                f"does not match eligible manifest row {source_row}: "
+                f"{case.key} != {source.key}"
+            )
+        if case.key in seen_keys:
+            raise ValueError(f"{path}: duplicate full case key {case.key}")
+        seen_keys.add(case.key)
+        indices = by_payload.setdefault(payload_id, {})
+        if context_index in indices:
+            raise ValueError(
+                f"{path}: duplicate context_index {context_index} for "
+                f"payload {payload_id!r}"
+            )
+        indices[context_index] = case
+
+    contexts: dict[str, list[EligibleCase]] = {}
+    for payload_id in CARRIED_FORWARD_PAYLOAD_IDS:
+        indices = by_payload.get(payload_id, {})
+        if sorted(indices) != list(range(1, V2_CONTEXTS_PER_PAYLOAD + 1)):
+            raise ValueError(
+                f"{path}: payload {payload_id!r} must define exactly "
+                f"context_index values 1..{V2_CONTEXTS_PER_PAYLOAD}; got "
+                f"{sorted(indices)}"
+            )
+        ordered = [indices[i] for i in range(1, V2_CONTEXTS_PER_PAYLOAD + 1)]
+        first = first_eligible_by_payload.get(payload_id)
+        if first is None or ordered[0].key != first.key:
+            raise ValueError(
+                f"{path}: context 1 for {payload_id!r} must be the first "
+                "eligible case (v1 fixed case)"
+            )
+        contexts[payload_id] = ordered
+
+    return contexts
+
+
 def load_corpus() -> dict[str, PayloadEntry]:
     """Return corpus entries keyed by payload ID."""
     data = json.loads(CORPUS_PATH.read_text(encoding="utf-8"))
@@ -318,13 +580,16 @@ def _completed_attempt_key(record: Any) -> tuple[str, ...] | None:
     return key if all(key) else None
 
 
-def load_completed_attempts() -> set[tuple[str, ...]]:
+def load_completed_attempts(
+    attempts_path: Path | None = None,
+) -> set[tuple[str, ...]]:
     """Return keys backed by a genuine completed AgentDojo verdict."""
-    if not ATTEMPTS_JSONL_PATH.exists():
+    path = attempts_path if attempts_path is not None else ATTEMPTS_JSONL_PATH
+    if not path.exists():
         return set()
     completed: set[tuple[str, ...]] = set()
     for line_no, line in enumerate(
-        ATTEMPTS_JSONL_PATH.read_text(encoding="utf-8").splitlines(), 1
+        path.read_text(encoding="utf-8").splitlines(), 1
     ):
         line = line.strip()
         if not line:
@@ -333,7 +598,7 @@ def load_completed_attempts() -> set[tuple[str, ...]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(
-                f"Malformed JSON in {ATTEMPTS_JSONL_PATH}:{line_no}: {exc}"
+                f"Malformed JSON in {path}:{line_no}: {exc}"
             ) from exc
         key = _completed_attempt_key(record)
         if key is not None:
@@ -341,12 +606,13 @@ def load_completed_attempts() -> set[tuple[str, ...]]:
     return completed
 
 
-def load_payload_successes() -> set[str]:
+def load_payload_successes(attempts_path: Path | None = None) -> set[str]:
     """Return payload IDs that already have a recorded native success."""
-    if not ATTEMPTS_JSONL_PATH.exists():
+    path = attempts_path if attempts_path is not None else ATTEMPTS_JSONL_PATH
+    if not path.exists():
         return set()
     succeeded: set[str] = set()
-    for line in ATTEMPTS_JSONL_PATH.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -361,12 +627,15 @@ def load_payload_successes() -> set[str]:
     return succeeded
 
 
-def count_payload_attempts_in_checkpoint() -> dict[str, int]:
+def count_payload_attempts_in_checkpoint(
+    attempts_path: Path | None = None,
+) -> dict[str, int]:
     """Return completed-verdict counts; errors remain retryable on resume."""
-    if not ATTEMPTS_JSONL_PATH.exists():
+    path = attempts_path if attempts_path is not None else ATTEMPTS_JSONL_PATH
+    if not path.exists():
         return {}
     counts: dict[str, int] = {}
-    for line in ATTEMPTS_JSONL_PATH.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -382,7 +651,9 @@ def count_payload_attempts_in_checkpoint() -> dict[str, int]:
     return counts
 
 
-def load_latest_completed_attempts() -> dict[tuple[str, ...], dict[str, Any]]:
+def load_latest_completed_attempts(
+    attempts_path: Path | None = None,
+) -> dict[tuple[str, ...], dict[str, Any]]:
     """Return the latest completed verdict record for each attempt key.
 
     The append-only checkpoint can contain retry rows for one deterministic
@@ -390,12 +661,13 @@ def load_latest_completed_attempts() -> dict[tuple[str, ...], dict[str, Any]]:
     Only completed verdict rows are eligible for the summary, and assigning as
     we scan preserves the latest completed row for each key.
     """
-    if not ATTEMPTS_JSONL_PATH.exists():
+    path = attempts_path if attempts_path is not None else ATTEMPTS_JSONL_PATH
+    if not path.exists():
         return {}
 
     completed: dict[tuple[str, ...], dict[str, Any]] = {}
     for line_no, line in enumerate(
-        ATTEMPTS_JSONL_PATH.read_text(encoding="utf-8").splitlines(), 1
+        path.read_text(encoding="utf-8").splitlines(), 1
     ):
         line = line.strip()
         if not line:
@@ -404,7 +676,7 @@ def load_latest_completed_attempts() -> dict[tuple[str, ...], dict[str, Any]]:
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(
-                f"Malformed JSON in {ATTEMPTS_JSONL_PATH}:{line_no}: {exc}"
+                f"Malformed JSON in {path}:{line_no}: {exc}"
             ) from exc
         key = _completed_attempt_key(record)
         if key is not None:
@@ -412,9 +684,11 @@ def load_latest_completed_attempts() -> dict[tuple[str, ...], dict[str, Any]]:
     return completed
 
 
-def build_loop_summary_from_checkpoint() -> dict[str, Any]:
+def build_loop_summary_from_checkpoint(
+    attempts_path: Path | None = None,
+) -> dict[str, Any]:
     """Build aggregate loop statistics from the full append-only checkpoint."""
-    completed = load_latest_completed_attempts()
+    completed = load_latest_completed_attempts(attempts_path)
     payloads: dict[str, dict[str, Any]] = {}
     for key in sorted(completed):
         payload_id = key[0]
@@ -435,10 +709,14 @@ def build_loop_summary_from_checkpoint() -> dict[str, Any]:
     }
 
 
-def append_attempt_record(record: dict[str, Any]) -> None:
+def append_attempt_record(
+    record: dict[str, Any],
+    attempts_path: Path | None = None,
+) -> None:
     """Append one attempt record to the checkpoint JSONL file."""
-    ATTEMPTS_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with ATTEMPTS_JSONL_PATH.open("a", encoding="utf-8") as handle:
+    path = attempts_path if attempts_path is not None else ATTEMPTS_JSONL_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -810,16 +1088,24 @@ def plan_attempts(
     strategy_descriptions: dict[str, str],
     *,
     payload_filter: str | None = None,
+    arm_id: str = "v1",
+    context_map: dict[str, list[EligibleCase]] | None = None,
 ) -> list[PlannedAttempt]:
-    """Build the deterministic ordered list of attempts.
+    """Build the deterministic ordered list of attempts for one arm.
 
-    Order: canonical payload order → strategy index (rounds 1–5).
-    Each payload's 5-mutation budget is spent against one fixed case:
-    the first eligible case in manifest order for that payload.  Only
-    the strategy advances each round; the case never changes within a
-    payload.  The loop enforces stopping on success or budget exhaustion
-    at runtime.
+    v1 (``contexts_per_payload == 1``): canonical payload order → strategy
+    index (rounds 1–5) against one fixed case, the first eligible case in
+    manifest order for that payload. Only the strategy advances each round.
+
+    v2a/v2b (``contexts_per_payload == 4``): rounds 1–20 per payload with
+    ``strategy = STRATEGY_IDS[(round - 1) // 4]`` and
+    ``case = context_map[payload][(round - 1) % 4]``, per the frozen
+    iteration_budget in each arm's design_freeze.json. Each strategy pairs
+    once with each of the four frozen contexts.
+
+    The loop enforces stopping on success or budget exhaustion at runtime.
     """
+    arm = resolve_arm(arm_id)
     payload_ids = (
         (payload_filter,) if payload_filter else CARRIED_FORWARD_PAYLOAD_IDS
     )
@@ -837,20 +1123,32 @@ def plan_attempts(
     attempts: list[PlannedAttempt] = []
     strategy_list = list(STRATEGY_IDS)
     for payload_id in payload_ids:
-        cases = payload_cases.get(payload_id, [])
-        if not cases:
-            logging.warning("No eligible cases for payload %r", payload_id)
-            continue
+        if arm.contexts_per_payload > 1:
+            contexts = list((context_map or {}).get(payload_id, []))
+            if len(contexts) != arm.contexts_per_payload:
+                raise ValueError(
+                    f"Arm {arm.arm_id!r} requires exactly "
+                    f"{arm.contexts_per_payload} contexts for payload "
+                    f"{payload_id!r}; got {len(contexts)}"
+                )
+        else:
+            cases = payload_cases.get(payload_id, [])
+            if not cases:
+                logging.warning("No eligible cases for payload %r", payload_id)
+                continue
+            # Fixed case: always the first eligible case in manifest order.
+            # All mutation strategies are applied against this one case.
+            contexts = [cases[0]]
         payload = corpus.get(payload_id)
         if payload is None:
             raise ValueError(f"Payload {payload_id!r} not found in corpus")
 
-        # Fixed case: always the first eligible case in manifest order.
-        # All 5 mutation strategies are applied against this one case.
-        fixed_case = cases[0]
-        for mutation_round in range(1, MAX_MUTATIONS_PER_PAYLOAD + 1):
-            strategy = strategy_list[(mutation_round - 1) % len(strategy_list)]
-            case = fixed_case
+        for mutation_round in range(1, arm.max_mutations_per_payload + 1):
+            strategy = strategy_list[
+                ((mutation_round - 1) // arm.contexts_per_payload)
+                % len(strategy_list)
+            ]
+            case = contexts[(mutation_round - 1) % arm.contexts_per_payload]
             key = AdaptiveAttemptKey(
                 payload_id=payload_id,
                 strategy_id=strategy,
@@ -890,9 +1188,12 @@ def _build_attempt_record(
     proposer_error: str | None,
     mutated_template: str | None,
     target_result: dict[str, Any] | None,
-    target_error: str | None = None,
     defense_sha256: str,
+    target_error: str | None = None,
     proposer_finish_reason: str | None = None,
+    adaptive_version: str = ADAPTIVE_VERSION,
+    proposer_model: str = GEMMA4_26B_MODEL,
+    target_model: str = GEMMA4_26B_MODEL,
 ) -> dict[str, Any]:
     """Build a complete attempt record for the checkpoint file."""
     mutated_sha256 = (
@@ -903,7 +1204,7 @@ def _build_attempt_record(
     return {
         "schema_version": 1,
         "attempt_id": attempt_id,
-        "adaptive_attack_version": ADAPTIVE_VERSION,
+        "adaptive_attack_version": adaptive_version,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "status": status,
         # Case identity
@@ -917,7 +1218,7 @@ def _build_attempt_record(
         "strategy_id": planned.strategy_id,
         "mutation_round": planned.mutation_round,
         # Proposer
-        "proposer_model": GEMMA4_26B_MODEL,
+        "proposer_model": proposer_model,
         "proposer_status": proposer_status,
         "proposer_requests": proposer_requests,
         "proposer_error": proposer_error,
@@ -926,7 +1227,7 @@ def _build_attempt_record(
         "mutated_template": mutated_template,
         "mutated_template_sha256": mutated_sha256,
         # Target
-        "target_model": GEMMA4_26B_MODEL,
+        "target_model": target_model,
         "defense": MY_SPOTLIGHTING,
         "defense_version": MY_SPOTLIGHTING_VERSION,
         "defense_sha256": defense_sha256,
@@ -970,24 +1271,43 @@ def run_adaptive_loop(
     payload_filter: str | None = None,
     dry_run: bool = False,
     max_new_attempts: int | None = None,
+    arm_id: str = "v1",
+    proposer_llm: Any | None = None,
 ) -> dict[str, Any]:
-    """Run the full adaptive attack loop, checkpointing every attempt.
+    """Run the adaptive attack loop for one arm, checkpointing every attempt.
+
+    ``proposer_llm`` lets the CLI pass the quota-guarded proposer object for
+    the v2b dual-key arm (a Gemini primary LLM on a dedicated limiter). When
+    omitted, the arm's default proposer is constructed here: Gemma for
+    v1/v2a, or an unguarded Gemini proposer for v2b (library use only —
+    recorded v2b runs must come through ``main()``).
 
     Returns a summary dict.
     """
     if max_new_attempts is not None and max_new_attempts <= 0:
         raise ValueError("max_new_attempts must be positive when provided")
 
+    arm = resolve_arm(arm_id)
+    attempts_path = arm_attempts_path(arm)
+    raw_root = arm_raw_traces_root(arm)
+    summary_path = arm_summary_path(arm)
+
     eligible_cases = load_eligible_cases()
     corpus = load_corpus()
     strategy_descriptions = load_strategy_descriptions()
     expected_defense_sha256 = defense_source_sha256()
+
+    context_map: dict[str, list[EligibleCase]] | None = None
+    if arm.contexts_per_payload > 1:
+        context_map = load_v2_contexts(eligible_cases)
 
     planned = plan_attempts(
         eligible_cases,
         corpus,
         strategy_descriptions,
         payload_filter=payload_filter,
+        arm_id=arm.arm_id,
+        context_map=context_map,
     )
 
     if dry_run:
@@ -1001,13 +1321,18 @@ def run_adaptive_loop(
             )
         return {"dry_run": True, "planned_count": len(planned)}
 
-    # Load checkpoint state
-    completed_keys = load_completed_attempts()
-    payload_succeeded = load_payload_successes()
-    payload_attempt_counts = count_payload_attempts_in_checkpoint()
+    # Load checkpoint state (this arm's file only; other arms are untouched)
+    completed_keys = load_completed_attempts(attempts_path)
+    payload_succeeded = load_payload_successes(attempts_path)
+    payload_attempt_counts = count_payload_attempts_in_checkpoint(attempts_path)
 
-    # Build a single proposer LLM (direct generate_content, no tool pipeline)
-    proposer_llm = get_google_gemma4_26b_llm()
+    # Build the proposer LLM (direct generate_content, no tool pipeline)
+    if proposer_llm is None:
+        if arm.dual_quota:
+            dedicated_limiter = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
+            proposer_llm = get_google_primary_llm(rate_limiter=dedicated_limiter)
+        else:
+            proposer_llm = get_google_gemma4_26b_llm()
 
     # Maintain per-payload prior-attempt feedback for the proposer
     prior_by_payload: dict[str, list[dict[str, Any]]] = {
@@ -1035,13 +1360,13 @@ def run_adaptive_loop(
                 pid,
             )
             continue
-        if payload_attempt_counts.get(pid, 0) >= MAX_MUTATIONS_PER_PAYLOAD:
+        if payload_attempt_counts.get(pid, 0) >= arm.max_mutations_per_payload:
             logging.info(
                 "Skipping %s: payload %r budget exhausted (%d/%d)",
                 attempt_key.attempt_id()[:12],
                 pid,
                 payload_attempt_counts.get(pid, 0),
-                MAX_MUTATIONS_PER_PAYLOAD,
+                arm.max_mutations_per_payload,
             )
             continue
 
@@ -1057,15 +1382,16 @@ def run_adaptive_loop(
         attempt_id = attempt_key.attempt_id()
 
         logging.info(
-            "Attempt %s: payload=%r strategy=%r "
+            "Attempt %s: arm=%s payload=%r strategy=%r "
             "case=(%s \u00d7 %s) round=%d/%d",
             attempt_id[:12],
+            arm.arm_id,
             pid,
             planned_attempt.strategy_id,
             case.user_task_id,
             case.injection_task_id,
             planned_attempt.mutation_round,
-            MAX_MUTATIONS_PER_PAYLOAD,
+            arm.max_mutations_per_payload,
         )
 
         # --- Proposer ---
@@ -1118,8 +1444,11 @@ def run_adaptive_loop(
                 mutated_template=None,
                 target_result=None,
                 defense_sha256=expected_defense_sha256,
+                adaptive_version=arm.adaptive_version,
+                proposer_model=arm.proposer_model,
+                target_model=arm.target_model,
             )
-            append_attempt_record(record)
+            append_attempt_record(record, attempts_path)
             raise
 
         if mutated_template is None:
@@ -1138,8 +1467,11 @@ def run_adaptive_loop(
                 target_result=None,
                 defense_sha256=expected_defense_sha256,
                 proposer_finish_reason=proposer_finish_reason,
+                adaptive_version=arm.adaptive_version,
+                proposer_model=arm.proposer_model,
+                target_model=arm.target_model,
             )
-            append_attempt_record(record)
+            append_attempt_record(record, attempts_path)
             new_attempts += 1
             # Preserve the failed generation without making the round terminal.
             payload_attempt_counts[pid] = payload_attempt_counts.get(pid, 0) + 1
@@ -1157,7 +1489,7 @@ def run_adaptive_loop(
                 attempt_id=attempt_id,
                 strategy_id=planned_attempt.strategy_id,
                 payload_id=pid,
-                raw_root=RAW_TRACES_ROOT,
+                raw_root=raw_root,
             )
             final_status = "completed"
         except (RequestBudgetExceeded, ClientError) as exc:
@@ -1175,8 +1507,11 @@ def run_adaptive_loop(
                 target_result=None,
                 target_error=target_error,
                 defense_sha256=expected_defense_sha256,
+                adaptive_version=arm.adaptive_version,
+                proposer_model=arm.proposer_model,
+                target_model=arm.target_model,
             )
-            append_attempt_record(record)
+            append_attempt_record(record, attempts_path)
             raise
         except Exception as exc:
             target_error = str(exc)
@@ -1200,8 +1535,11 @@ def run_adaptive_loop(
             target_result=target_result,
             target_error=target_error,
             defense_sha256=expected_defense_sha256,
+            adaptive_version=arm.adaptive_version,
+            proposer_model=arm.proposer_model,
+            target_model=arm.target_model,
         )
-        append_attempt_record(record)
+        append_attempt_record(record, attempts_path)
         new_attempts += 1
         if final_status == "completed":
             completed_keys.add(attempt_key.key_tuple)
@@ -1244,8 +1582,7 @@ def run_adaptive_loop(
             )
 
     # Write summary artifact
-    summary = build_loop_summary_from_checkpoint()
-    summary_path = ADAPTIVE_ROOT / "loop_summary.json"
+    summary = build_loop_summary_from_checkpoint(attempts_path)
     atomic_write_json(summary_path, summary)
     return summary
 
@@ -1264,6 +1601,16 @@ def _positive_int(value: str) -> int:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--arm",
+        choices=tuple(ARMS),
+        default="v1",
+        help=(
+            "Adaptive-search arm to run (default: v1, the completed "
+            "five-mutation search; v2a/v2b are the predeclared "
+            "twenty-mutation, four-context expansions)"
+        ),
+    )
     parser.add_argument(
         "--payload",
         metavar="PAYLOAD_ID",
@@ -1286,6 +1633,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         ),
     )
     add_quota_arguments(parser, required=False)
+    proposer = parser.add_argument_group(
+        "v2b proposer quota",
+        (
+            "Required only for --arm v2b: a fresh Gemini 3.5 Flash-Lite "
+            "dashboard reading and cap for the proposer's own 500-RPD "
+            "ledger key, metered separately from the Gemma target key"
+        ),
+    )
+    proposer.add_argument(
+        "--proposer-dashboard-used",
+        type=int,
+        default=None,
+        help="Current gemini-3.5-flash-lite RPD usage shown by the dashboard",
+    )
+    proposer.add_argument(
+        "--proposer-dashboard-limit",
+        type=int,
+        default=None,
+        help="Current gemini-3.5-flash-lite RPD limit shown by the dashboard",
+    )
+    proposer.add_argument(
+        "--proposer-max-api-requests",
+        type=_positive_int,
+        default=None,
+        help="Requested hard request-attempt cap for the proposer key",
+    )
     return parser.parse_args(argv)
 
 
@@ -1296,18 +1669,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
     args = parse_args(argv)
+    arm = resolve_arm(args.arm)
 
     if args.plan:
         eligible_cases = load_eligible_cases()
         corpus = load_corpus()
         strategy_descriptions = load_strategy_descriptions()
+        context_map = (
+            load_v2_contexts(eligible_cases)
+            if arm.contexts_per_payload > 1
+            else None
+        )
         planned = plan_attempts(
             eligible_cases,
             corpus,
             strategy_descriptions,
             payload_filter=args.payload,
+            arm_id=arm.arm_id,
+            context_map=context_map,
         )
-        print(f"Planned {len(planned)} attempts (dry run — no API calls):")
+        print(f"Planned {len(planned)} attempts (arm {arm.arm_id}; no API calls):")
         for p in planned:
             print(
                 f"  [{p.attempt_key.attempt_id()[:12]}] "
@@ -1331,8 +1712,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 1
 
-    # Quota guard — keyed to Gemma, not Gemini
-    guard = quota_guard_from_args(args, quota_key=QUOTA_KEY)
+    proposer_llm: Any | None = None
+    if arm.dual_quota:
+        # v2b meters two quota keys in one process: the Gemini proposer on a
+        # dedicated limiter and the Gemma target on the shared limiter. The
+        # two keys are reserved and reconciled independently and are never
+        # cross-reconciled (MultiQuotaGuard, one ledger lock).
+        missing = [
+            name
+            for name in (
+                "proposer_dashboard_used",
+                "proposer_dashboard_limit",
+                "proposer_max_api_requests",
+            )
+            if getattr(args, name) is None
+        ]
+        if missing:
+            rendered = ", ".join(
+                "--" + name.replace("_", "-") for name in missing
+            )
+            print(
+                f"ERROR: --arm v2b requires proposer quota argument(s): "
+                f"{rendered}",
+                file=sys.stderr,
+            )
+            return 1
+        proposer_limiter = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
+        proposer_guard = QuotaGuard(
+            quota_date=args.quota_date,
+            dashboard_used=args.proposer_dashboard_used,
+            dashboard_limit=args.proposer_dashboard_limit,
+            max_api_requests=args.proposer_max_api_requests,
+            quota_key=PRIMARY_MODEL,
+            study_rpd_limit=PRIMARY_RPD_LIMIT,
+            configure_attempt_limit=proposer_limiter.set_max_requests,
+            get_attempt_count=lambda: proposer_limiter.requests_started,
+        )
+        target_guard = quota_guard_from_args(args, quota_key=QUOTA_KEY)
+        guard = MultiQuotaGuard([proposer_guard, target_guard])
+        proposer_llm = get_google_primary_llm(rate_limiter=proposer_limiter)
+    else:
+        # Quota guard — keyed to Gemma, not Gemini
+        guard = quota_guard_from_args(args, quota_key=QUOTA_KEY)
 
     try:
         with guard:
@@ -1340,6 +1761,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 payload_filter=args.payload,
                 dry_run=False,
                 max_new_attempts=args.max_new_attempts,
+                arm_id=arm.arm_id,
+                proposer_llm=proposer_llm,
             )
     except RequestBudgetExceeded as exc:
         print(f"Quota cap reached: {exc}", file=sys.stderr)

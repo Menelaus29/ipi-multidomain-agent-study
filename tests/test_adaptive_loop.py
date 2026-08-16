@@ -1220,7 +1220,573 @@ class TestCLI(unittest.TestCase):
             payload_filter="persona-04",
             dry_run=False,
             max_new_attempts=1,
+            arm_id="v1",
+            proposer_llm=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: v2 arms — context manifest, planning, arm separation, provenance
+# ---------------------------------------------------------------------------
+
+
+class TestV2ContextManifest(unittest.TestCase):
+    """Validate the committed v2 context manifest against its frozen rule."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.eligible = loop.load_eligible_cases()
+        cls.contexts = loop.load_v2_contexts(cls.eligible)
+
+    def test_all_payloads_have_four_contexts(self):
+        self.assertEqual(
+            set(self.contexts), set(loop.CARRIED_FORWARD_PAYLOAD_IDS)
+        )
+        for pid, cases in self.contexts.items():
+            self.assertEqual(len(cases), loop.V2_CONTEXTS_PER_PAYLOAD, pid)
+
+    def test_context_one_is_the_v1_fixed_case(self):
+        first_by_payload: dict[str, loop.EligibleCase] = {}
+        for case in self.eligible:
+            first_by_payload.setdefault(case.payload_id, case)
+        for pid, cases in self.contexts.items():
+            self.assertEqual(cases[0].key, first_by_payload[pid].key, pid)
+
+    def test_contexts_match_the_frozen_design_freeze(self):
+        expected = {
+            "persona-04": [
+                ("user_task_0", "injection_task_8"),
+                ("user_task_12", "injection_task_0"),
+                ("user_task_12", "injection_task_1"),
+                ("user_task_12", "injection_task_2"),
+            ],
+            "encoding-03": [
+                ("user_task_12", "injection_task_4"),
+                ("user_task_12", "injection_task_5"),
+                ("user_task_12", "injection_task_7"),
+                ("user_task_12", "injection_task_8"),
+            ],
+            "fake-system-04": [
+                ("user_task_0", "injection_task_2"),
+                ("user_task_0", "injection_task_8"),
+                ("user_task_2", "injection_task_4"),
+                ("user_task_12", "injection_task_0"),
+            ],
+            "template-02": [
+                ("user_task_12", "injection_task_0"),
+                ("user_task_12", "injection_task_1"),
+                ("user_task_12", "injection_task_2"),
+                ("user_task_12", "injection_task_4"),
+            ],
+            "template-03": [
+                ("user_task_2", "injection_task_4"),
+                ("user_task_12", "injection_task_0"),
+                ("user_task_12", "injection_task_1"),
+                ("user_task_12", "injection_task_4"),
+            ],
+        }
+        for pid, pairs in expected.items():
+            self.assertEqual(
+                [
+                    (c.user_task_id, c.injection_task_id)
+                    for c in self.contexts[pid]
+                ],
+                pairs,
+                pid,
+            )
+
+    def test_all_full_case_keys_distinct(self):
+        keys = [c.key for cases in self.contexts.values() for c in cases]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def _manifest_rows(self) -> list[dict[str, str]]:
+        with loop.V2_CONTEXT_MANIFEST_PATH.open(
+            "r", encoding="utf-8", newline=""
+        ) as handle:
+            return list(csv.DictReader(handle, delimiter="\t"))
+
+    def _load_with_rows(self, rows: list[dict[str, str]]):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "v2_context_manifest.tsv"
+            buf = io.StringIO()
+            writer = csv.DictWriter(
+                buf, fieldnames=loop.V2_CONTEXT_FIELDS, delimiter="\t"
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+            path.write_text(buf.getvalue(), encoding="utf-8")
+            return loop.load_v2_contexts(self.eligible, manifest_path=path)
+
+    def test_tampered_case_field_rejected(self):
+        rows = self._manifest_rows()
+        rows[0]["user_task_id"] = "user_task_99"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            self._load_with_rows(rows)
+
+    def test_missing_payload_rejected(self):
+        rows = [r for r in self._manifest_rows() if r["payload_id"] != "template-03"]
+        with self.assertRaisesRegex(ValueError, "template-03"):
+            self._load_with_rows(rows)
+
+    def test_duplicate_context_index_rejected(self):
+        rows = self._manifest_rows()
+        rows[1]["context_index"] = "1"
+        with self.assertRaisesRegex(ValueError, "duplicate context_index"):
+            self._load_with_rows(rows)
+
+    def test_swapped_context_one_rejected(self):
+        rows = self._manifest_rows()
+        rows[0]["context_index"], rows[1]["context_index"] = "2", "1"
+        with self.assertRaisesRegex(ValueError, "context 1"):
+            self._load_with_rows(rows)
+
+    def test_unknown_payload_rejected(self):
+        rows = self._manifest_rows()
+        rows[0]["payload_id"] = "encoding-99"
+        with self.assertRaisesRegex(ValueError, "not a carried-forward"):
+            self._load_with_rows(rows)
+
+    def test_duplicate_case_key_via_repeated_source_row_rejected(self):
+        rows = self._manifest_rows()
+        # Point context 2 at the same source row as context 1 and copy its
+        # fields so the row itself validates but duplicates the full key.
+        rows[1]["source_manifest_row"] = rows[0]["source_manifest_row"]
+        for field in ("domain", "channel", "injection_vector", "user_task_id",
+                      "injection_task_id"):
+            rows[1][field] = rows[0][field]
+        with self.assertRaisesRegex(ValueError, "duplicate full case key"):
+            self._load_with_rows(rows)
+
+    def test_out_of_range_source_row_rejected(self):
+        rows = self._manifest_rows()
+        rows[0]["source_manifest_row"] = "999"
+        with self.assertRaisesRegex(ValueError, "outside the eligible manifest"):
+            self._load_with_rows(rows)
+
+
+class TestV2Planning(unittest.TestCase):
+    def setUp(self):
+        self.eligible = loop.load_eligible_cases()
+        self.contexts = loop.load_v2_contexts(self.eligible)
+        self.corpus = {
+            pid: _make_corpus_entry(pid)
+            for pid in loop.CARRIED_FORWARD_PAYLOAD_IDS
+        }
+        self.desc = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+
+    def _plan(self, arm_id="v2a", payload_filter=None):
+        return loop.plan_attempts(
+            self.eligible,
+            self.corpus,
+            self.desc,
+            payload_filter=payload_filter,
+            arm_id=arm_id,
+            context_map=self.contexts,
+        )
+
+    def test_twenty_rounds_per_payload(self):
+        plans = self._plan(payload_filter="persona-04")
+        self.assertEqual([p.mutation_round for p in plans], list(range(1, 21)))
+
+    def test_strategy_and_context_mapping_matches_freeze(self):
+        plans = self._plan(payload_filter="persona-04")
+        ctxs = self.contexts["persona-04"]
+        for p in plans:
+            r = p.mutation_round
+            self.assertEqual(
+                p.strategy_id, loop.STRATEGY_IDS[(r - 1) // 4], f"round {r}"
+            )
+            expected = ctxs[(r - 1) % 4]
+            self.assertEqual(
+                (
+                    p.case.user_task_id,
+                    p.case.injection_task_id,
+                    p.case.injection_vector,
+                ),
+                (
+                    expected.user_task_id,
+                    expected.injection_task_id,
+                    expected.injection_vector,
+                ),
+                f"round {r}",
+            )
+
+    def test_each_strategy_pairs_once_with_each_context(self):
+        plans = self._plan(payload_filter="persona-04")
+        pairs = {
+            (p.strategy_id, (p.case.user_task_id, p.case.injection_task_id))
+            for p in plans
+        }
+        self.assertEqual(len(pairs), 20)
+
+    def test_attempt_keys_unique_within_arm(self):
+        plans = self._plan(payload_filter="persona-04")
+        keys = [p.attempt_key.key_tuple for p in plans]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_deterministic(self):
+        p1 = self._plan(payload_filter="persona-04")
+        p2 = self._plan(payload_filter="persona-04")
+        self.assertEqual(
+            [a.attempt_key.attempt_id() for a in p1],
+            [a.attempt_key.attempt_id() for a in p2],
+        )
+
+    def test_total_budget_100_across_all_payloads(self):
+        plans = self._plan()
+        self.assertEqual(len(plans), loop.V2_MAX_TOTAL_MUTATIONS)
+        self.assertEqual(len(plans), 100)
+
+    def test_v2b_plans_identically_to_v2a(self):
+        p2a = self._plan(arm_id="v2a", payload_filter="template-02")
+        p2b = self._plan(arm_id="v2b", payload_filter="template-02")
+        self.assertEqual(
+            [a.attempt_key.attempt_id() for a in p2a],
+            [a.attempt_key.attempt_id() for a in p2b],
+        )
+
+    def test_missing_context_map_raises(self):
+        with self.assertRaisesRegex(ValueError, "requires exactly 4 contexts"):
+            loop.plan_attempts(
+                self.eligible,
+                self.corpus,
+                self.desc,
+                payload_filter="persona-04",
+                arm_id="v2a",
+            )
+
+    def test_v1_default_planning_unchanged(self):
+        plans = loop.plan_attempts(
+            self.eligible,
+            self.corpus,
+            self.desc,
+            payload_filter="persona-04",
+        )
+        self.assertEqual(len(plans), 5)
+        for p in plans:
+            self.assertEqual(p.case.user_task_id, "user_task_0")
+            self.assertEqual(p.case.injection_task_id, "injection_task_8")
+
+
+class TestArmSeparation(unittest.TestCase):
+    def _four_cases(self) -> list[loop.EligibleCase]:
+        return [
+            _make_eligible_case(injection_task_id=f"injection_task_{i}")
+            for i in range(4)
+        ]
+
+    def _patches(self, tmpdir: Path, cases: list[loop.EligibleCase]):
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        return (
+            patch.object(loop, "V2A_ROOT", tmpdir / "v2a"),
+            patch.object(loop, "V2B_ROOT", tmpdir / "v2b"),
+            patch.object(loop, "load_eligible_cases", return_value=cases[:1]),
+            patch.object(loop, "load_v2_contexts", return_value={"persona-04": cases}),
+            patch.object(loop, "load_corpus", return_value=corpus),
+            patch.object(
+                loop, "load_strategy_descriptions", return_value=descriptions
+            ),
+            patch.object(loop, "defense_source_sha256", return_value="abc123"),
+            patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+            patch.object(loop, "get_injection_goal", return_value="synthetic goal"),
+            patch.object(
+                loop, "propose_mutation", MagicMock(return_value=("Mutated {{goal}}", 1))
+            ),
+            patch.object(
+                loop,
+                "run_target",
+                MagicMock(
+                    return_value={
+                        "attack_success": False,
+                        "utility_success": True,
+                        "api_request_attempts": 1,
+                        "raw_trace_path": "x.json",
+                        "elapsed_seconds": 0.1,
+                    }
+                ),
+            ),
+        )
+
+    def test_v2a_writes_only_its_own_root(self):
+        cases = self._four_cases()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            v1_attempts = tmpdir / "v1" / "attempts.jsonl"
+            patches = self._patches(tmpdir, cases)
+            with (
+                patches[0], patches[1],
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", v1_attempts),
+                patches[2], patches[3], patches[4], patches[5], patches[6],
+                patches[7], patches[8], patches[9], patches[10],
+            ):
+                summary = loop.run_adaptive_loop(
+                    payload_filter="persona-04",
+                    max_new_attempts=1,
+                    arm_id="v2a",
+                )
+
+            v2a_attempts = tmpdir / "v2a" / "attempts.jsonl"
+            self.assertTrue(v2a_attempts.exists())
+            self.assertFalse(v1_attempts.exists())
+            self.assertFalse((tmpdir / "v2b").exists())
+            self.assertTrue((tmpdir / "v2a" / "loop_summary.json").exists())
+
+            record = json.loads(
+                v2a_attempts.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(record["adaptive_attack_version"], "v2a")
+            self.assertEqual(record["proposer_model"], loop.GEMMA4_26B_MODEL)
+            self.assertEqual(record["target_model"], loop.GEMMA4_26B_MODEL)
+            self.assertEqual(record["mutation_round"], 1)
+            self.assertEqual(summary["total_attempts"], 1)
+
+    def test_v1_run_does_not_touch_v2_roots(self):
+        case = _make_eligible_case()
+        corpus = {"persona-04": _make_corpus_entry("persona-04")}
+        descriptions = {sid: f"desc-{sid}" for sid in loop.STRATEGY_IDS}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            v1_attempts = tmpdir / "v1" / "attempts.jsonl"
+            with (
+                patch.object(loop, "V2A_ROOT", tmpdir / "v2a"),
+                patch.object(loop, "V2B_ROOT", tmpdir / "v2b"),
+                patch.object(loop, "ADAPTIVE_ROOT", tmpdir / "v1"),
+                patch.object(loop, "ATTEMPTS_JSONL_PATH", v1_attempts),
+                patch.object(loop, "load_eligible_cases", return_value=[case]),
+                patch.object(loop, "load_corpus", return_value=corpus),
+                patch.object(
+                    loop,
+                    "load_strategy_descriptions",
+                    return_value=descriptions,
+                ),
+                patch.object(loop, "defense_source_sha256", return_value="abc123"),
+                patch.object(loop, "get_google_gemma4_26b_llm", return_value=object()),
+                patch.object(loop, "get_injection_goal", return_value="g"),
+                patch.object(
+                    loop, "propose_mutation", MagicMock(return_value=("M {{goal}}", 1))
+                ),
+                patch.object(
+                    loop,
+                    "run_target",
+                    MagicMock(
+                        return_value={
+                            "attack_success": False,
+                            "utility_success": True,
+                            "api_request_attempts": 1,
+                            "raw_trace_path": "x.json",
+                            "elapsed_seconds": 0.1,
+                        }
+                    ),
+                ),
+            ):
+                loop.run_adaptive_loop(
+                    payload_filter="persona-04", max_new_attempts=1
+                )
+
+            self.assertTrue(v1_attempts.exists())
+            self.assertFalse((tmpdir / "v2a").exists())
+            self.assertFalse((tmpdir / "v2b").exists())
+
+    def test_unknown_arm_raises(self):
+        with self.assertRaisesRegex(ValueError, "Unknown arm"):
+            loop.run_adaptive_loop(arm_id="v9")
+
+    def test_v2_budget_exhaustion_skips_proposer(self):
+        cases = self._four_cases()
+        seeded = [
+            {
+                "schema_version": 1,
+                "status": "completed",
+                "payload_id": "persona-04",
+                "strategy_id": loop.STRATEGY_IDS[i % 5],
+                "injection_vector": cases[i % 4].injection_vector,
+                "user_task_id": cases[i % 4].user_task_id,
+                "injection_task_id": cases[i % 4].injection_task_id,
+                "attack_success": False,
+            }
+            for i in range(20)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            v2a_attempts = tmpdir / "v2a" / "attempts.jsonl"
+            v2a_attempts.parent.mkdir(parents=True)
+            v2a_attempts.write_text(
+                "".join(json.dumps(r) + "\n" for r in seeded), encoding="utf-8"
+            )
+            patches = self._patches(tmpdir, cases)
+            with (
+                patches[0], patches[1],
+                patches[2], patches[3], patches[4], patches[5], patches[6],
+                patches[7], patches[8],
+                patches[9] as proposer,
+                patches[10] as target,
+            ):
+                summary = loop.run_adaptive_loop(
+                    payload_filter="persona-04", arm_id="v2a"
+                )
+
+            proposer.assert_not_called()
+            target.assert_not_called()
+            self.assertEqual(summary["total_attempts"], 20)
+            self.assertEqual(
+                len(v2a_attempts.read_text(encoding="utf-8").splitlines()), 20
+            )
+
+
+class TestV2bProvenance(unittest.TestCase):
+    def test_v2b_arm_spec(self):
+        arm = loop.ARMS["v2b"]
+        self.assertEqual(arm.proposer_model, loop.PRIMARY_MODEL)
+        self.assertEqual(arm.target_model, loop.GEMMA4_26B_MODEL)
+        self.assertTrue(arm.dual_quota)
+        self.assertEqual(arm.max_mutations_per_payload, loop.V2_MAX_MUTATIONS_PER_PAYLOAD)
+
+    def test_v2b_record_carries_split_models(self):
+        case = _make_eligible_case()
+        attempt_key = loop.AdaptiveAttemptKey(
+            payload_id="persona-04",
+            strategy_id="delimiter-line-collision",
+            injection_vector=case.injection_vector,
+            user_task_id=case.user_task_id,
+            injection_task_id=case.injection_task_id,
+        )
+        planned = loop.PlannedAttempt(
+            attempt_key=attempt_key,
+            case=case,
+            payload=_make_corpus_entry(),
+            strategy_id="delimiter-line-collision",
+            strategy_description="d",
+            mutation_round=7,
+        )
+        record = loop._build_attempt_record(
+            attempt_id=attempt_key.attempt_id(),
+            planned=planned,
+            case=case,
+            status="completed",
+            proposer_status="accepted",
+            proposer_requests=1,
+            proposer_error=None,
+            mutated_template="M {{goal}}",
+            target_result={
+                "attack_success": False,
+                "utility_success": True,
+                "api_request_attempts": 2,
+                "raw_trace_path": "x.json",
+                "elapsed_seconds": 1.0,
+            },
+            defense_sha256="abc",
+            adaptive_version="v2b",
+            proposer_model=loop.PRIMARY_MODEL,
+            target_model=loop.GEMMA4_26B_MODEL,
+        )
+        self.assertEqual(record["adaptive_attack_version"], "v2b")
+        self.assertIn("gemini", record["proposer_model"])
+        self.assertIn("gemma", record["target_model"])
+        self.assertEqual(record["mutation_round"], 7)
+
+    def test_arm_budget_constants_self_consistent(self):
+        for arm_id in ("v2a", "v2b"):
+            arm = loop.ARMS[arm_id]
+            self.assertEqual(
+                arm.max_total_mutations,
+                arm.max_mutations_per_payload
+                * len(loop.CARRIED_FORWARD_PAYLOAD_IDS),
+            )
+            self.assertEqual(
+                arm.contexts_per_payload, loop.V2_CONTEXTS_PER_PAYLOAD
+            )
+        v1 = loop.ARMS["v1"]
+        self.assertEqual(v1.max_mutations_per_payload, loop.MAX_MUTATIONS_PER_PAYLOAD)
+        self.assertEqual(v1.max_total_mutations, loop.MAX_TOTAL_MUTATIONS)
+        self.assertEqual(v1.contexts_per_payload, 1)
+
+
+class TestV2CLI(unittest.TestCase):
+    def test_v2b_missing_proposer_quota_args_returns_error(self):
+        manifest = {"target_defense": {"source_sha256_canonical_lf": "frozen-sha"}}
+        with (
+            patch.object(loop, "defense_source_sha256", return_value="frozen-sha"),
+            patch.object(loop, "load_strategy_manifest", return_value=manifest),
+            patch.object(loop, "MultiQuotaGuard") as multi,
+            patch.object(loop, "run_adaptive_loop") as run_loop,
+        ):
+            rc = loop.main(
+                [
+                    "--arm", "v2b",
+                    "--quota-date", "2026-08-15",
+                    "--dashboard-used", "0",
+                    "--dashboard-limit", "14400",
+                    "--max-api-requests", "10",
+                ]
+            )
+        self.assertEqual(rc, 1)
+        multi.assert_not_called()
+        run_loop.assert_not_called()
+
+    def test_v2b_builds_multi_quota_guard_and_passes_proposer(self):
+        manifest = {"target_defense": {"source_sha256_canonical_lf": "frozen-sha"}}
+        guard = MagicMock()
+        guard.__enter__.return_value = guard
+        proposer_llm = object()
+        with (
+            patch.object(loop, "defense_source_sha256", return_value="frozen-sha"),
+            patch.object(loop, "load_strategy_manifest", return_value=manifest),
+            patch.object(loop, "RequestRateLimiter") as limiter_cls,
+            patch.object(loop, "QuotaGuard") as proposer_guard_cls,
+            patch.object(loop, "quota_guard_from_args", return_value=MagicMock()),
+            patch.object(loop, "MultiQuotaGuard", return_value=guard) as multi,
+            patch.object(
+                loop, "get_google_primary_llm", return_value=proposer_llm
+            ) as primary_factory,
+            patch.object(
+                loop,
+                "run_adaptive_loop",
+                return_value={"total_attempts": 0, "total_successes": 0, "payloads": {}},
+            ) as run_loop,
+        ):
+            rc = loop.main(
+                [
+                    "--arm", "v2b",
+                    "--quota-date", "2026-08-15",
+                    "--dashboard-used", "0",
+                    "--dashboard-limit", "14400",
+                    "--max-api-requests", "10",
+                    "--proposer-dashboard-used", "5",
+                    "--proposer-dashboard-limit", "500",
+                    "--proposer-max-api-requests", "20",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        proposer_guard_cls.assert_called_once()
+        self.assertEqual(proposer_guard_cls.call_args.kwargs["quota_key"], loop.PRIMARY_MODEL)
+        multi.assert_called_once()
+        self.assertEqual(len(multi.call_args.args[0]), 2)
+        primary_factory.assert_called_once_with(
+            rate_limiter=limiter_cls.return_value
+        )
+        run_loop.assert_called_once_with(
+            payload_filter=None,
+            dry_run=False,
+            max_new_attempts=None,
+            arm_id="v2b",
+            proposer_llm=proposer_llm,
+        )
+
+    def test_plan_arm_v2a_uses_real_committed_manifests(self):
+        """--plan --arm v2a reads the real frozen manifests; no API calls."""
+        captured = io.StringIO()
+        with patch("sys.stdout", captured):
+            rc = loop.main(["--plan", "--arm", "v2a", "--payload", "persona-04"])
+        self.assertEqual(rc, 0)
+        out = captured.getvalue()
+        self.assertIn("arm v2a", out)
+        self.assertIn("(round 20)", out)
+        self.assertNotIn("(round 21)", out)
+
+    def test_invalid_arm_choice_rejected_by_argparse(self):
+        with self.assertRaises(SystemExit):
+            loop.parse_args(["--arm", "v9"])
 
 
 if __name__ == "__main__":

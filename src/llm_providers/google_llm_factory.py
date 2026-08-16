@@ -595,7 +595,11 @@ class Gemini3LLM(GoogleLLM):
         return query, runtime, env, new_messages, new_extra_args
 
 
-def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
+def get_google_llm(
+    model_name: str = PRIMARY_MODEL,
+    *,
+    rate_limiter: RequestRateLimiter | None = None,
+) -> Gemini3LLM:
     """
     Construct a GoogleLLM pipeline element using the free Google AI Studio path.
 
@@ -605,6 +609,11 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
 
     Args:
         model_name: Gemini model identifier. Defaults to PRIMARY_MODEL.
+        rate_limiter: Optional dedicated request limiter. When omitted, the
+            process-wide shared limiter is used, which is what every
+            single-model runner wants. The v2b adaptive arm passes a private
+            limiter so Gemini proposer requests are metered separately from
+            the Gemma target requests on the shared limiter.
     Returns:
         GoogleLLM instance with .name set to include the canonical
         AgentDojo Gemini model ID so that attacks can resolve the
@@ -622,6 +631,7 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
     llm = Gemini3LLM(
         model_name,
         client,
+        rate_limiter=rate_limiter,
         token_pacer=(
             _GEMMA4_TOKEN_PACER if model_name == GEMMA4_26B_MODEL else None
         ),
@@ -632,11 +642,13 @@ def get_google_llm(model_name: str = PRIMARY_MODEL) -> Gemini3LLM:
     return llm
 
 
-def get_google_primary_llm() -> Gemini3LLM:
+def get_google_primary_llm(
+    rate_limiter: RequestRateLimiter | None = None,
+) -> Gemini3LLM:
     """Return a Gemini3LLM using the primary model (gemini-3.5-flash-lite).
     Use this for all recorded experiment runs.
     """
-    return get_google_llm(PRIMARY_MODEL)
+    return get_google_llm(PRIMARY_MODEL, rate_limiter=rate_limiter)
 
 
 def get_google_fallback_llm() -> Gemini3LLM:
