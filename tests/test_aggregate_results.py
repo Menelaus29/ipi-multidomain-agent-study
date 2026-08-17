@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from src.analysis import aggregate_results
 
@@ -32,6 +33,7 @@ GEMMA_METADATA = (
 )
 DISCOVERY_PLAN = PROJECT_ROOT / "data" / "baseline" / "plan.tsv"
 CORPUS = PROJECT_ROOT / "src" / "payloads" / "corpus.json"
+ADAPTIVE_ROOT = PROJECT_ROOT / "data" / "adaptive" / "g4"
 
 
 def _write_plan(path: Path, rows: list[dict[str, str]]) -> None:
@@ -878,6 +880,342 @@ class CommittedArtifactRegressionTests(unittest.TestCase):
                     generated.read_bytes().replace(b"\r\n", b"\n"),
                     msg=f"committed summary differs for {partition}",
                 )
+
+class TestPhase11AdaptiveAggregation(unittest.TestCase):
+    """No-network reconciliation for task 11.6's versioned adaptive arms."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.arms = {
+            arm: aggregate_results.reconcile_adaptive_arm(
+                arm=arm, adaptive_root=ADAPTIVE_ROOT
+            )
+            for arm in ("v1", "v2a", "v2b")
+        }
+        cls.repair_rows, cls.repair_latest = aggregate_results.reconcile_v2a_repairs(
+            adaptive_root=ADAPTIVE_ROOT, v2a=cls.arms["v2a"]
+        )
+        cls.phase9_cases, cls.phase9_provenance = (
+            aggregate_results._phase9_fresh160_cases()
+        )
+
+    def test_arm_specific_checkpoint_totals_and_models(self) -> None:
+        expected = {
+            "v1": (28, 24, 24, 1, "gemma-4-26b-a4b-it"),
+            "v2a": (92, 89, 88, 1, "gemma-4-26b-a4b-it"),
+            "v2b": (33, 33, 33, 5, "gemini-3.5-flash-lite"),
+        }
+        for arm, (physical, logical, target, successes, proposer) in expected.items():
+            aggregation = self.arms[arm]
+            self.assertEqual(physical, len(aggregation.physical_rows))
+            self.assertEqual(logical, len(aggregation.terminal_rows))
+            self.assertEqual(
+                target,
+                sum(
+                    row["status"] == "completed"
+                    for row in aggregation.effective_rows.values()
+                ),
+            )
+            self.assertEqual(
+                successes,
+                sum(
+                    row.get("attack_success") is True
+                    for row in aggregation.effective_rows.values()
+                ),
+            )
+            self.assertEqual(proposer, aggregation.spec.proposer_model)
+            self.assertEqual("gemma-4-26b-a4b-it", aggregation.spec.target_model)
+
+    def test_v2a_repairs_replace_source_slots_without_growing_logical_budget(self) -> None:
+        self.assertEqual(18, len(self.repair_rows))
+        self.assertEqual(16, len(self.repair_latest))
+        self.assertEqual(16, len(self.arms["v2a"].repaired_source_ids))
+        self.assertEqual(89, len(self.arms["v2a"].terminal_rows))
+        self.assertEqual(89, len(self.arms["v2a"].effective_rows))
+        template_rows = [
+            row
+            for row in self.arms["v2a"].effective_rows.values()
+            if row["payload_id"] == "template-02"
+        ]
+        self.assertEqual(20, len(template_rows))
+        self.assertEqual(20, sum(row["status"] == "completed" for row in template_rows))
+        self.assertEqual(0, sum(row.get("attack_success") is True for row in template_rows))
+
+    def test_arm_summaries_reproduce_non_bypass_accounting(self) -> None:
+        totals = {}
+        for arm, aggregation in self.arms.items():
+            rows = aggregate_results.summarize_adaptive_arm(aggregation)
+            total = next(
+                row for row in rows if row["row_type"] == "arm_total_descriptive"
+            )
+            totals[arm] = total
+            self.assertNotIn("pooled ASR", " ".join(str(value) for value in total.values()))
+        self.assertEqual(
+            (24, 24, 1, 23, 2, 2),
+            tuple(
+                totals["v1"][field]
+                for field in (
+                    "logical_rounds",
+                    "target_evaluations",
+                    "native_successes",
+                    "native_target_failures",
+                    "target_error_rows",
+                    "target_retry_events",
+                )
+            ),
+        )
+        self.assertEqual(
+            (89, 88, 1, 87, 16, 1, 3, 2),
+            tuple(
+                totals["v2a"][field]
+                for field in (
+                    "logical_rounds",
+                    "target_evaluations",
+                    "native_successes",
+                    "native_target_failures",
+                    "source_slots_replaced_by_repair",
+                    "renderability_skips",
+                    "target_error_rows",
+                    "target_retry_events",
+                )
+            ),
+        )
+        self.assertEqual(
+            (33, 33, 5, 28, 5, 0),
+            tuple(
+                totals["v2b"][field]
+                for field in (
+                    "logical_rounds",
+                    "target_evaluations",
+                    "native_successes",
+                    "native_target_failures",
+                    "payloads_bypassed",
+                    "budget_exhausted",
+                )
+            ),
+        )
+
+    def test_post_adaptive_delta_uses_case_key_union_not_attempt_asr(self) -> None:
+        rows = aggregate_results.build_post_adaptive_comparison(
+            phase9_cases=self.phase9_cases,
+            phase9_provenance=self.phase9_provenance,
+            arms=self.arms,
+            repair_successes=0,
+        )
+        by_arm = {row["arm"]: row for row in rows}
+        self.assertEqual(4, by_arm["v2a"]["phase9_defended_successes"])
+        self.assertEqual(160, by_arm["v2a"]["phase9_denominator"])
+        self.assertEqual(
+            5, by_arm["v2a"]["observed_post_adaptive_compromised_case_keys"]
+        )
+        self.assertEqual(
+            "0.0312500000", by_arm["v2a"]["observed_post_adaptive_coverage"]
+        )
+        self.assertEqual(
+            "0.6250000000", by_arm["v2a"]["delta_percentage_points_vs_phase9"]
+        )
+        self.assertEqual(
+            9, by_arm["v2b"]["observed_post_adaptive_compromised_case_keys"]
+        )
+        self.assertEqual(
+            "0.0562500000", by_arm["v2b"]["observed_post_adaptive_coverage"]
+        )
+        self.assertEqual(
+            "3.1250000000", by_arm["v2b"]["delta_percentage_points_vs_phase9"]
+        )
+        self.assertEqual(
+            "", by_arm["v2a_repair"]["observed_post_adaptive_coverage"]
+        )
+        self.assertEqual(
+            "true", by_arm["v2a"]["primary_post_adaptive_comparison"]
+        )
+        self.assertIn("not mutation-attempt ASR", by_arm["v2a"]["interpretation"])
+
+    def test_exact_design_freeze_hashes_are_bound_for_every_arm(self) -> None:
+        for arm, expected in aggregate_results.ADAPTIVE_DESIGN_FREEZE_SHA256.items():
+            actual = aggregate_results.canonical_lf_sha256(
+                ADAPTIVE_ROOT / arm / "design_freeze.json"
+            )
+            self.assertEqual(expected, actual)
+
+    def test_duplicate_completed_raw_trace_reference_is_rejected(self) -> None:
+        rows = [
+            {
+                "status": "completed",
+                "attempt_id": "attempt-a",
+                "_validated_raw_trace_path": "same-trace.json",
+            },
+            {
+                "status": "completed",
+                "attempt_id": "attempt-b",
+                "_validated_raw_trace_path": "same-trace.json",
+            },
+        ]
+        with self.assertRaisesRegex(
+            aggregate_results.AggregationError, "reference the same raw trace"
+        ):
+            aggregate_results._validate_unique_completed_trace_paths(
+                rows, label="test-arm"
+            )
+
+    def test_late_reconciliation_failure_writes_no_outputs(self) -> None:
+        with patch.object(
+            aggregate_results,
+            "_phase9_fresh160_cases",
+            side_effect=aggregate_results.AggregationError("broken Phase 9 reference"),
+        ), patch.object(aggregate_results, "_atomic_write") as atomic_write:
+            with self.assertRaisesRegex(
+                aggregate_results.AggregationError, "broken Phase 9 reference"
+            ):
+                aggregate_results.aggregate_phase11_adaptive(
+                    adaptive_root=ADAPTIVE_ROOT
+                )
+        atomic_write.assert_not_called()
+
+    def test_wrong_model_hash_and_missing_trace_are_rejected(self) -> None:
+        aggregation = self.arms["v2b"]
+        row = dict(
+            next(item for item in aggregation.physical_rows if item["status"] == "completed")
+        )
+        schedule = aggregate_results._allowed_schedule(
+            spec=aggregation.spec, adaptive_root=ADAPTIVE_ROOT
+        )
+        bad_model = dict(row)
+        bad_model["proposer_model"] = "gemma-4-26b-a4b-it"
+        with self.assertRaisesRegex(
+            aggregate_results.AggregationError, "proposer model mismatch"
+        ):
+            aggregate_results._validate_main_attempt_row(
+                bad_model,
+                spec=aggregation.spec,
+                arm_root=ADAPTIVE_ROOT / "v2b",
+                schedule=schedule,
+            )
+        bad_hash = dict(row)
+        bad_hash["defense_sha256"] = "0" * 64
+        with self.assertRaisesRegex(
+            aggregate_results.AggregationError, "defense hash mismatch"
+        ):
+            aggregate_results._validate_main_attempt_row(
+                bad_hash,
+                spec=aggregation.spec,
+                arm_root=ADAPTIVE_ROOT / "v2b",
+                schedule=schedule,
+            )
+        missing_trace = dict(row)
+        missing_trace["raw_trace_path"] = (
+            "data/adaptive/g4/v2b/results/raw/does-not-exist.json"
+        )
+        with self.assertRaisesRegex(
+            aggregate_results.AggregationError, "missing raw trace"
+        ):
+            aggregate_results._validate_main_attempt_row(
+                missing_trace,
+                spec=aggregation.spec,
+                arm_root=ADAPTIVE_ROOT / "v2b",
+                schedule=schedule,
+            )
+
+    def test_raw_verdict_mismatch_is_rejected(self) -> None:
+        aggregation = self.arms["v2b"]
+        row = dict(
+            next(item for item in aggregation.physical_rows if item["status"] == "completed")
+        )
+        schedule = {
+            (row["payload_id"], row["mutation_round"]):
+            aggregate_results._adaptive_case_key(row)
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            arm_root = root / "data/adaptive/g4/v2b"
+            trace = arm_root / "results/raw/mismatch.json"
+            trace.parent.mkdir(parents=True)
+            trace.write_text(
+                json.dumps(
+                    {
+                        "error": None,
+                        "security": not row["attack_success"],
+                        "utility": row["utility_success"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            row["raw_trace_path"] = "data/adaptive/g4/v2b/results/raw/mismatch.json"
+            with patch.object(aggregate_results, "PROJECT_ROOT", root):
+                with self.assertRaisesRegex(
+                    aggregate_results.AggregationError, "native verdict mismatch"
+                ):
+                    aggregate_results._validate_main_attempt_row(
+                        row,
+                        spec=aggregation.spec,
+                        arm_root=arm_root,
+                        schedule=schedule,
+                    )
+
+    def test_unrelated_repair_source_is_rejected(self) -> None:
+        source = ADAPTIVE_ROOT / "v2a_repair" / "attempts.jsonl"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        first = json.loads(lines[0])
+        first["source_attempt_id"] = "not-a-v2a-source"
+        lines[0] = json.dumps(first, ensure_ascii=False, sort_keys=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repair_root = root / "v2a_repair"
+            repair_root.mkdir(parents=True)
+            (repair_root / "attempts.jsonl").write_text(
+                "\n".join(lines), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(
+                aggregate_results.AggregationError,
+                "unrelated repair source_attempt_id",
+            ):
+                aggregate_results.reconcile_v2a_repairs(
+                    adaptive_root=root, v2a=self.arms["v2a"]
+                )
+
+    def test_committed_adaptive_outputs_are_byte_stable(self) -> None:
+        comparison_rows = aggregate_results.build_post_adaptive_comparison(
+            phase9_cases=self.phase9_cases,
+            phase9_provenance=self.phase9_provenance,
+            arms=self.arms,
+            repair_successes=0,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for arm, aggregation in self.arms.items():
+                generated = root / f"{arm}.csv"
+                aggregate_results.write_csv(
+                    generated,
+                    aggregate_results.summarize_adaptive_arm(aggregation),
+                    fieldnames=aggregate_results.ADAPTIVE_SUMMARY_FIELDS,
+                )
+                committed = ADAPTIVE_ROOT / arm / "aggregate_summary.csv"
+                self.assertEqual(committed.read_bytes(), generated.read_bytes())
+            repair_generated = root / "repair.csv"
+            aggregate_results.write_csv(
+                repair_generated,
+                aggregate_results.summarize_repair_suite(
+                    rows=self.repair_rows, latest=self.repair_latest
+                ),
+                fieldnames=aggregate_results.ADAPTIVE_SUMMARY_FIELDS,
+            )
+            self.assertEqual(
+                (ADAPTIVE_ROOT / "v2a_repair/aggregate_summary.csv").read_bytes(),
+                repair_generated.read_bytes(),
+            )
+            first = root / "comparison-1.csv"
+            second = root / "comparison-2.csv"
+            for output in (first, second):
+                aggregate_results.write_csv(
+                    output,
+                    comparison_rows,
+                    fieldnames=aggregate_results.POST_ADAPTIVE_COMPARISON_FIELDS,
+                )
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            self.assertEqual(
+                (ADAPTIVE_ROOT / "post_adaptive_comparison.csv").read_bytes(),
+                first.read_bytes(),
+            )
 
 
 if __name__ == "__main__":

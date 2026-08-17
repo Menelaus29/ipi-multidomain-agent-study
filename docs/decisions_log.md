@@ -252,3 +252,29 @@ whether the output passed validation.
 **Reason:** Read-only `git show` at commit `7c354f9a0cc74df9286287f87499709fcbfd076b` found 33/40 strict-parser malformed rows in `mutate/generator_attempts.jsonl` and only 1/40 malformed with zero refusals in `mutate_v2/generator_attempts.jsonl`. The sole v2 malformed note records an environment-renderability failure, not a refusal; five same-seed rows that were malformed under the strict parser were accepted in v2 with `fenced_json` normalization and notes stating that JSON and the goal token validated after canonical normalization.
 
 **Impact:** The expected v2b proposer malformed/refusal rate remains approximately 2.5% or lower with the adaptive loop's equally tolerant extraction chain; this is an engineering expectation, not an executed v2b result.
+
+### Phase 10/11 — Scoped template-02 malformed-proposer repair
+
+**Decision:** Add `src/adaptive/repair_malformed.py`, a separate checkpoint and raw-trace namespace that regenerates and benchmarks only the sixteen v2a `template-02` rounds rejected for duplicate `{{goal}}` placeholders; the original v2a JSONL remains read-only. The repair path rejects obvious double-encoded JSON template wrappers before target execution.
+
+**Reason:** The original rows contain no usable candidate or target verdict, so they cannot be benchmarked by resume alone. A narrowly scoped repair runner permits fresh proposals and accepts one or more goal placeholders only for this supplemental path; skipped proposer/renderability rows remain retryable, without changing normal adaptive-loop parsing or touching other payload results.
+
+**Impact:** Repair artifacts are written under `data/adaptive/g4/v2a_repair/`, are reported separately from v2a, and require the same Gemma quota guard before any future live execution.
+
+### Phase 11 — Logical template-02 merge for 11.4/11.5 reporting
+
+**Decision:** For Phase 11.4/11.5 reporting, join each completed
+`v2a_repair` row to its sixteen malformed `v2a` source rounds and treat the
+result as one logical 20-round `v2a` `template-02` run; retain the separate raw
+artifact roots only as provenance.
+
+**Reason:** The original `v2a` rows for those rounds contain no target verdict,
+while the repair execution completes the same predeclared rounds. Reporting
+only the four original target evaluations would omit the complete payload view;
+the user's accepted Phase 11 scope requires the repaired results to be merged,
+while keeping `v2b` as a distinct proposer-model ablation.
+
+**Impact:** `report/case_studies/` reports 20 logical `v2a` `template-02`
+rounds—four original completed rows plus sixteen source-linked repair rows—with
+zero native successes. The immutable JSONL/checkpoint/raw files remain under
+their existing arm-specific paths, and no repair row is pooled with `v2b`.
