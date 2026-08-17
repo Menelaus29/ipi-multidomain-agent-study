@@ -15,7 +15,9 @@ from google.genai.errors import ClientError
 
 from src.experiments.quota_guard import (
     ConcurrentQuotaRunError,
+    MultiQuotaGuard,
     QuotaGuard,
+    QuotaGuardError,
     QuotaValidationError,
     add_quota_arguments,
     pacific_quota_date,
@@ -277,6 +279,23 @@ class QuotaGuardTests(unittest.TestCase):
         self.assertIsNotNone(resolved[0]["interruption_resolved_at"])
         self.assertEqual(37, resolved[0]["resolution_dashboard_used"])
 
+    def test_exhausted_fresh_observation_still_persists_interruption_resolution(
+        self,
+    ) -> None:
+        with self.assertRaises(KeyboardInterrupt):
+            with self.guard(dashboard_used=0, max_api_requests=100):
+                self.attempts.count += 1
+                raise KeyboardInterrupt
+
+        with self.assertRaisesRegex(QuotaValidationError, "No positive"):
+            with self.guard(dashboard_used=475, max_api_requests=100):
+                pass
+
+        records = _records(self.ledger)
+        self.assertEqual(1, len(records), "no new reservation may be appended")
+        self.assertIsNotNone(records[0]["interruption_resolved_at"])
+        self.assertEqual(475, records[0]["resolution_dashboard_used"])
+
     def test_zero_attempt_exception_reconciles_without_stranding_reservation(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "validation failed"):
             with self.guard(dashboard_used=30, max_api_requests=100):
@@ -420,6 +439,215 @@ class RetryAccountingTests(unittest.TestCase):
 
         self.assertEqual(1, limiter.requests_started)
         self.assertEqual(1, client.models.calls)
+
+
+class MultiQuotaGuardTests(unittest.TestCase):
+    """Dual-key reservation for the v2b adaptive arm (Gemini + Gemma)."""
+
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.ledger = Path(self.temporary_directory.name) / "quota_ledger.jsonl"
+        self.proposer_attempts = _AttemptState()
+        self.target_attempts = _AttemptState()
+
+    def proposer_guard(
+        self,
+        *,
+        dashboard_used: int = 0,
+        dashboard_limit: int = 500,
+        max_api_requests: int = 100,
+        output: StringIO | None = None,
+    ) -> QuotaGuard:
+        return QuotaGuard(
+            quota_date=FIXED_DATE,
+            dashboard_used=dashboard_used,
+            dashboard_limit=dashboard_limit,
+            max_api_requests=max_api_requests,
+            quota_key=PRIMARY_MODEL,
+            study_rpd_limit=500,
+            ledger_path=self.ledger,
+            now_utc=lambda: FIXED_NOW,
+            configure_attempt_limit=self.proposer_attempts.configure,
+            get_attempt_count=self.proposer_attempts.get,
+            output=output or StringIO(),
+        )
+
+    def target_guard(
+        self,
+        *,
+        dashboard_used: int = 0,
+        dashboard_limit: int = GEMMA4_26B_RPD_LIMIT,
+        max_api_requests: int = 800,
+        output: StringIO | None = None,
+    ) -> QuotaGuard:
+        return QuotaGuard(
+            quota_date=FIXED_DATE,
+            dashboard_used=dashboard_used,
+            dashboard_limit=dashboard_limit,
+            max_api_requests=max_api_requests,
+            quota_key=GEMMA4_26B_MODEL,
+            study_rpd_limit=GEMMA4_26B_RPD_LIMIT,
+            ledger_path=self.ledger,
+            now_utc=lambda: FIXED_NOW,
+            configure_attempt_limit=self.target_attempts.configure,
+            get_attempt_count=self.target_attempts.get,
+            output=output or StringIO(),
+        )
+
+    def test_reserves_both_keys_in_one_ledger_write(self) -> None:
+        with MultiQuotaGuard(
+            [self.proposer_guard(), self.target_guard()]
+        ) as multi:
+            records = _records(self.ledger)
+            self.assertEqual(
+                [PRIMARY_MODEL, GEMMA4_26B_MODEL],
+                [record["quota_key"] for record in records],
+            )
+            self.assertTrue(all(record["reserved_attempts"] > 0 for record in records))
+            self.assertEqual([100], self.proposer_attempts.configured)
+            self.assertEqual([800], self.target_attempts.configured)
+            self.assertEqual(2, len(multi.guards))
+
+    def test_reconciles_each_key_from_its_own_counter_only(self) -> None:
+        with MultiQuotaGuard(
+            [self.proposer_guard(), self.target_guard()]
+        ):
+            self.proposer_attempts.count += 3
+            self.target_attempts.count += 7
+
+        records = _records(self.ledger)
+        by_key = {record["quota_key"]: record for record in records}
+        self.assertEqual(3, by_key[PRIMARY_MODEL]["actual_attempts"])
+        self.assertEqual(7, by_key[GEMMA4_26B_MODEL]["actual_attempts"])
+        self.assertIsNotNone(by_key[PRIMARY_MODEL]["reconciled_at"])
+        self.assertIsNotNone(by_key[GEMMA4_26B_MODEL]["reconciled_at"])
+
+    def test_one_key_cannot_reserve_blocks_all_keys(self) -> None:
+        # 500 - 490 - 25 reserve leaves nothing for the proposer key.
+        with self.assertRaises(QuotaValidationError):
+            with MultiQuotaGuard(
+                [
+                    self.proposer_guard(dashboard_used=490),
+                    self.target_guard(),
+                ]
+            ):
+                pass
+        self.assertFalse(self.ledger.exists())
+        self.assertEqual([], self.proposer_attempts.configured)
+        self.assertEqual([], self.target_attempts.configured)
+
+    def test_interruption_retains_both_reservations(self) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        with self.assertRaises(Boom):
+            with MultiQuotaGuard(
+                [self.proposer_guard(), self.target_guard()]
+            ):
+                self.proposer_attempts.count += 2
+                self.target_attempts.count += 5
+                raise Boom
+
+        records = _records(self.ledger)
+        self.assertEqual(2, len(records))
+        for record in records:
+            self.assertIsNone(record["reconciled_at"])
+            self.assertIsNone(record["actual_attempts"])
+
+        # A later run with fresh dashboard readings resolves both open
+        # reservations and reserves again under the same keys.
+        with MultiQuotaGuard(
+            [self.proposer_guard(), self.target_guard()]
+        ):
+            pass
+        records = _records(self.ledger)
+        self.assertEqual(4, len(records))
+        resolved = [r for r in records if r["interruption_resolved_at"] is not None]
+        self.assertEqual(2, len(resolved))
+
+    def test_failed_multi_reservation_persists_resolutions_for_both_keys(
+        self,
+    ) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        with self.assertRaises(Boom):
+            with MultiQuotaGuard(
+                [self.proposer_guard(), self.target_guard()]
+            ):
+                self.proposer_attempts.count += 1
+                self.target_attempts.count += 1
+                raise Boom
+
+        with self.assertRaisesRegex(QuotaValidationError, "No positive"):
+            with MultiQuotaGuard(
+                [
+                    self.proposer_guard(dashboard_used=1),
+                    self.target_guard(
+                        dashboard_used=GEMMA4_26B_RPD_LIMIT - 25
+                    ),
+                ]
+            ):
+                pass
+
+        records = _records(self.ledger)
+        self.assertEqual(2, len(records), "new reservations are all-or-nothing")
+        self.assertTrue(
+            all(record["interruption_resolved_at"] is not None for record in records)
+        )
+
+    def test_exception_with_zero_attempts_on_one_key_reconciles_only_it(self) -> None:
+        class Boom(RuntimeError):
+            pass
+
+        with self.assertRaises(Boom):
+            with MultiQuotaGuard(
+                [self.proposer_guard(), self.target_guard()]
+            ):
+                self.target_attempts.count += 4
+                raise Boom
+
+        by_key = {record["quota_key"]: record for record in _records(self.ledger)}
+        # The proposer made no request, so its reservation reconciles to 0;
+        # the target key retains its conservative open reservation.
+        self.assertEqual(0, by_key[PRIMARY_MODEL]["actual_attempts"])
+        self.assertIsNone(by_key[GEMMA4_26B_MODEL]["reconciled_at"])
+        self.assertIsNone(by_key[GEMMA4_26B_MODEL]["actual_attempts"])
+
+    def test_rejects_duplicate_keys(self) -> None:
+        with self.assertRaises(QuotaGuardError):
+            MultiQuotaGuard([self.proposer_guard(), self.proposer_guard()])
+
+    def test_rejects_empty_guard_list(self) -> None:
+        with self.assertRaises(QuotaGuardError):
+            MultiQuotaGuard([])
+
+    def test_rejects_mixed_ledger_paths(self) -> None:
+        other = QuotaGuard(
+            quota_date=FIXED_DATE,
+            dashboard_used=0,
+            dashboard_limit=500,
+            max_api_requests=10,
+            quota_key=GEMMA4_26B_MODEL,
+            study_rpd_limit=GEMMA4_26B_RPD_LIMIT,
+            ledger_path=Path(self.temporary_directory.name) / "other.jsonl",
+            now_utc=lambda: FIXED_NOW,
+            configure_attempt_limit=self.target_attempts.configure,
+            get_attempt_count=self.target_attempts.get,
+            output=StringIO(),
+        )
+        with self.assertRaises(QuotaGuardError):
+            MultiQuotaGuard([self.proposer_guard(), other])
+
+    def test_lock_contention_rejects_a_second_process_session(self) -> None:
+        first = MultiQuotaGuard([self.proposer_guard(), self.target_guard()])
+        with first:
+            with self.assertRaises(ConcurrentQuotaRunError):
+                with MultiQuotaGuard(
+                    [self.proposer_guard(), self.target_guard()]
+                ):
+                    pass
 
 
 if __name__ == "__main__":

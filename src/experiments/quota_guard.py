@@ -446,7 +446,50 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
         if self._entered:
             raise QuotaGuardError("QuotaGuard instances cannot be re-entered")
 
-        current = self._now_utc()
+        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._lock.acquire(timeout=0)
+        except Timeout as error:
+            raise ConcurrentQuotaRunError(
+                f"Another experiment process holds quota lock {self.lock_path}"
+            ) from error
+
+        try:
+            records = _read_ledger(self.ledger_path)
+            records_before_plan = [dict(record) for record in records]
+            try:
+                record = self._plan_reservation(records, self._now_utc())
+            except BaseException:
+                # A fresh dashboard observation safely resolves abandoned
+                # reservations even when it also proves that no new positive
+                # budget remains. Persist those resolutions without creating
+                # a new reservation.
+                if records != records_before_plan:
+                    _write_ledger_atomic(self.ledger_path, records)
+                raise
+            records.append(record)
+            _write_ledger_atomic(self.ledger_path, records)
+            self._commit_reservation(len(records) - 1)
+        except BaseException:
+            self._lock.release()
+            raise
+        return self
+
+    def _plan_reservation(
+        self, records: list[dict[str, Any]], current: datetime
+    ) -> dict[str, Any]:
+        """Validate inputs, resolve open same-key reservations, and stage this
+        guard's new reservation against ``records`` without writing the ledger.
+
+        The caller must already hold the ledger lock. Resolutions mutate
+        ``records`` in place; appending the returned record and writing the
+        ledger atomically is the caller's responsibility, so a
+        :class:`MultiQuotaGuard` can stage several quota keys and commit them
+        in a single all-or-nothing write.
+        """
+        if self._entered:
+            raise QuotaGuardError("QuotaGuard instances cannot be re-entered")
+
         expected_date = pacific_quota_date(current)
         quota_date = _validate_quota_date(self.supplied_quota_date, expected_date)
         dashboard_used = _require_count(self.dashboard_used, "dashboard_used")
@@ -466,129 +509,199 @@ class QuotaGuard(AbstractContextManager["QuotaGuard"]):
                 "dashboard_used cannot exceed dashboard_limit"
             )
 
-        self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self._lock.acquire(timeout=0)
-        except Timeout as error:
-            raise ConcurrentQuotaRunError(
-                f"Another experiment process holds quota lock {self.lock_path}"
-            ) from error
+        timestamp = _utc_timestamp(current)
 
-        try:
-            records = _read_ledger(self.ledger_path)
-            timestamp = _utc_timestamp(current)
+        # Acquiring the whole-run lock proves that same-day open records are
+        # abandoned. This invocation's freshly supplied dashboard value
+        # resolves them without guessing their actual attempt count.
+        for record in records:
+            if (
+                record["quota_date"] == quota_date
+                and record["quota_key"] == self.quota_key
+                and _is_open_reservation(record)
+            ):
+                record["interruption_resolved_at"] = timestamp
+                record["resolution_dashboard_used"] = dashboard_used
 
-            # Acquiring the whole-run lock proves that same-day open records are
-            # abandoned. This invocation's freshly supplied dashboard value
-            # resolves them without guessing their actual attempt count.
-            resolved_any = False
-            for record in records:
-                if (
-                    record["quota_date"] == quota_date
-                    and record["quota_key"] == self.quota_key
-                    and _is_open_reservation(record)
-                ):
-                    record["interruption_resolved_at"] = timestamp
-                    record["resolution_dashboard_used"] = dashboard_used
-                    resolved_any = True
-            if resolved_any:
-                _write_ledger_atomic(self.ledger_path, records)
-
-            effective_limit = min(study_rpd_limit, dashboard_limit)
-            ledger_used = _ledger_known_used(records, quota_date, self.quota_key)
-            known_used = max(dashboard_used, ledger_used)
-            available = effective_limit - known_used - EXPERIMENT_RESERVE
-            effective_cap = min(requested_cap, available)
-            if effective_cap <= 0:
-                raise QuotaValidationError(
-                    "No positive experiment budget remains: "
-                    f"effective_limit={effective_limit}, known_used={known_used}, "
-                    f"reserve={EXPERIMENT_RESERVE}"
-                )
-
-            attempts_before = _require_count(
-                self._get_attempt_count(), "process request-attempt count"
-            )
-            self._configure_attempt_limit(attempts_before + effective_cap)
-
-            print(
-                f"Google quota budget ({self.quota_key}): "
-                f"requested={requested_cap}, effective={effective_cap}, "
-                f"daily_limit={effective_limit}, known_used={known_used}, "
-                f"reserve={EXPERIMENT_RESERVE}",
-                file=self._output,
+        effective_limit = min(study_rpd_limit, dashboard_limit)
+        ledger_used = _ledger_known_used(records, quota_date, self.quota_key)
+        known_used = max(dashboard_used, ledger_used)
+        available = effective_limit - known_used - EXPERIMENT_RESERVE
+        effective_cap = min(requested_cap, available)
+        if effective_cap <= 0:
+            raise QuotaValidationError(
+                "No positive experiment budget remains: "
+                f"effective_limit={effective_limit}, known_used={known_used}, "
+                f"reserve={EXPERIMENT_RESERVE}"
             )
 
-            record = {
-                "schema_version": LEDGER_SCHEMA_VERSION,
-                "quota_key": self.quota_key,
-                "study_rpd_limit": study_rpd_limit,
-                "quota_date": quota_date,
-                "reserved_at": timestamp,
-                "dashboard_used": dashboard_used,
-                "dashboard_limit": dashboard_limit,
-                "effective_limit": effective_limit,
-                "known_used_before": known_used,
-                "requested_cap": requested_cap,
-                "reserved_attempts": effective_cap,
-                "reconciled_at": None,
-                "actual_attempts": None,
-                "interruption_resolved_at": None,
-                "resolution_dashboard_used": None,
-            }
-            records.append(record)
-            _write_ledger_atomic(self.ledger_path, records)
+        attempts_before = _require_count(
+            self._get_attempt_count(), "process request-attempt count"
+        )
 
-            self._record_index = len(records) - 1
-            self._attempts_before = attempts_before
-            self._effective_cap = effective_cap
-            self._effective_limit = effective_limit
-            self._known_used = known_used
-            self._entered = True
-            return self
-        except BaseException:
-            self._lock.release()
-            raise
+        print(
+            f"Google quota budget ({self.quota_key}): "
+            f"requested={requested_cap}, effective={effective_cap}, "
+            f"daily_limit={effective_limit}, known_used={known_used}, "
+            f"reserve={EXPERIMENT_RESERVE}",
+            file=self._output,
+        )
+
+        self._attempts_before = attempts_before
+        self._effective_cap = effective_cap
+        self._effective_limit = effective_limit
+        self._known_used = known_used
+
+        return {
+            "schema_version": LEDGER_SCHEMA_VERSION,
+            "quota_key": self.quota_key,
+            "study_rpd_limit": study_rpd_limit,
+            "quota_date": quota_date,
+            "reserved_at": timestamp,
+            "dashboard_used": dashboard_used,
+            "dashboard_limit": dashboard_limit,
+            "effective_limit": effective_limit,
+            "known_used_before": known_used,
+            "requested_cap": requested_cap,
+            "reserved_attempts": effective_cap,
+            "reconciled_at": None,
+            "actual_attempts": None,
+            "interruption_resolved_at": None,
+            "resolution_dashboard_used": None,
+        }
+
+    def _commit_reservation(self, record_index: int) -> None:
+        """Configure the process cap and mark the guard entered (lock held)."""
+        if self._attempts_before is None or self._effective_cap is None:
+            raise QuotaGuardError("QuotaGuard reservation was never planned")
+        self._configure_attempt_limit(self._attempts_before + self._effective_cap)
+        self._record_index = record_index
+        self._entered = True
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
         if not self._entered:
             return False
         try:
-            if self._attempts_before is None or self._record_index is None:
-                raise QuotaGuardError("QuotaGuard reconciliation state is incomplete")
-            attempts_after = _require_count(
-                self._get_attempt_count(), "process request-attempt count"
-            )
-            actual_attempts = attempts_after - self._attempts_before
-            if actual_attempts < 0:
-                raise QuotaGuardError(
-                    "Process request-attempt count decreased during the guarded run"
-                )
-            if actual_attempts > self.effective_cap:
-                raise QuotaGuardError(
-                    "Process exceeded its reserved request-attempt cap"
-                )
-
-            # A deterministic validation failure discovered after acquiring the
-            # experiment lock made no provider request and therefore must not
-            # strand the conservative reservation.  Once any request has
-            # started, retain the open reservation on exceptional exit so the
-            # existing interruption-recovery accounting remains conservative.
-            if exc_type is None or actual_attempts == 0:
-                records = _read_ledger(self.ledger_path)
-                if self._record_index >= len(records):
-                    raise QuotaGuardError("Quota reservation disappeared from the ledger")
-                record = records[self._record_index]
-                if not _is_open_reservation(record):
-                    raise QuotaGuardError(
-                        "Quota reservation was modified before reconciliation"
-                    )
-                record["reconciled_at"] = _utc_timestamp(self._now_utc())
-                record["actual_attempts"] = actual_attempts
-                _write_ledger_atomic(self.ledger_path, records)
+            self._reconcile_locked(exc_type)
         finally:
             self._entered = False
             self._lock.release()
+        return False
+
+    def _reconcile_locked(self, exc_type: object) -> None:
+        """Reconcile this guard's ledger record; the caller holds the lock."""
+        if self._attempts_before is None or self._record_index is None:
+            raise QuotaGuardError("QuotaGuard reconciliation state is incomplete")
+        attempts_after = _require_count(
+            self._get_attempt_count(), "process request-attempt count"
+        )
+        actual_attempts = attempts_after - self._attempts_before
+        if actual_attempts < 0:
+            raise QuotaGuardError(
+                "Process request-attempt count decreased during the guarded run"
+            )
+        if actual_attempts > self.effective_cap:
+            raise QuotaGuardError(
+                "Process exceeded its reserved request-attempt cap"
+            )
+
+        # A deterministic validation failure discovered after acquiring the
+        # experiment lock made no provider request and therefore must not
+        # strand the conservative reservation.  Once any request has
+        # started, retain the open reservation on exceptional exit so the
+        # existing interruption-recovery accounting remains conservative.
+        if exc_type is None or actual_attempts == 0:
+            records = _read_ledger(self.ledger_path)
+            if self._record_index >= len(records):
+                raise QuotaGuardError("Quota reservation disappeared from the ledger")
+            record = records[self._record_index]
+            if not _is_open_reservation(record):
+                raise QuotaGuardError(
+                    "Quota reservation was modified before reconciliation"
+                )
+            record["reconciled_at"] = _utc_timestamp(self._now_utc())
+            record["actual_attempts"] = actual_attempts
+            _write_ledger_atomic(self.ledger_path, records)
+
+
+class MultiQuotaGuard(AbstractContextManager["MultiQuotaGuard"]):
+    """Reserve and reconcile several model-specific budgets under one lock.
+
+    The v2b adaptive arm meters a Gemini proposer and a Gemma target inside
+    one process. Each wrapped :class:`QuotaGuard` owns one quota key, its own
+    attempt counter, and its own dashboard inputs, and every guard must share
+    one ledger file so all reservations commit atomically under the single
+    whole-run lock. Records are reconciled per key — one key's consumption is
+    never counted or reconciled against another key.
+    """
+
+    def __init__(self, guards: Sequence[QuotaGuard]) -> None:
+        guards = list(guards)
+        if not guards:
+            raise QuotaGuardError("MultiQuotaGuard requires at least one guard")
+        if len({guard.ledger_path for guard in guards}) != 1:
+            raise QuotaGuardError(
+                "MultiQuotaGuard guards must share one ledger path"
+            )
+        keys = [guard.quota_key for guard in guards]
+        if len(set(keys)) != len(keys):
+            raise QuotaGuardError(
+                "MultiQuotaGuard guards must use distinct quota keys"
+            )
+        self._guards = guards
+
+    @property
+    def guards(self) -> list[QuotaGuard]:
+        return list(self._guards)
+
+    def __enter__(self) -> "MultiQuotaGuard":
+        first = self._guards[0]
+        first.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            first._lock.acquire(timeout=0)
+        except Timeout as error:
+            raise ConcurrentQuotaRunError(
+                f"Another experiment process holds quota lock {first.lock_path}"
+            ) from error
+
+        try:
+            records = _read_ledger(first.ledger_path)
+            records_before_plan = [dict(record) for record in records]
+            current = first._now_utc()
+            # Plan every key before writing anything: if any key cannot
+            # reserve (invalid inputs, exhausted budget), no key reserves.
+            try:
+                planned = [
+                    guard._plan_reservation(records, current)
+                    for guard in self._guards
+                ]
+            except BaseException:
+                # Resolution of abandoned reservations is independent from
+                # the all-or-nothing rule for *new* multi-key reservations.
+                # Keep the fresh observations even if one key cannot reserve.
+                if records != records_before_plan:
+                    _write_ledger_atomic(first.ledger_path, records)
+                raise
+            first_index = len(records)
+            records.extend(planned)
+            _write_ledger_atomic(first.ledger_path, records)
+            for offset, guard in enumerate(self._guards):
+                guard._commit_reservation(first_index + offset)
+        except BaseException:
+            first._lock.release()
+            raise
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        first = self._guards[0]
+        try:
+            for guard in self._guards:
+                if guard._entered:
+                    guard._reconcile_locked(exc_type)
+        finally:
+            for guard in self._guards:
+                guard._entered = False
+            first._lock.release()
         return False
 
 

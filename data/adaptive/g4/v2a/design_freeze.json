@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "study_id": "gemma4-banking-defense-adaptive-v2a",
+  "adaptive_attack_version": "v2a",
+  "arm": "v2a",
+  "freeze_status": "frozen-before-api",
+  "analysis_role": "Gemma-proposer defense-adaptive search with expanded predeclared budget and context rotation",
+  "benchmark_version": "v1.2.2",
+  "source_artifacts": {
+    "strategy_manifest_path": "data/adaptive/g4/v1/strategy_manifest.json",
+    "strategy_manifest_sha256_canonical_lf": "a5793d32e6b0c5d02d0d8358a4d90504087b4b488662d91e659c3438bdf45e84",
+    "eligible_case_manifest_path": "data/adaptive/g4/v1/eligible_stopped_cases.tsv",
+    "eligible_case_manifest_sha256_canonical_lf": "f316c85090715d4240a3ef4f82d29378c6fc4fd1feaabde2b0f51f2a517959be",
+    "context_manifest_path": "data/adaptive/g4/v2_context_manifest.tsv",
+    "context_manifest_sha256_canonical_lf": "672180d29bff3689fc0980d621373b509a8b6a8fd89e5df2c9d898d762d47844",
+    "defense_freeze_path": "data/defended/g4/v1/defense_freeze.json",
+    "defense_freeze_sha256": "3e4a7c43e1788a9da4287e71eade5317a9df72e7adccf0ace347069253272085",
+    "defense_source_path": "src/defenses/my_spotlighting.py",
+    "defense_source_sha256_canonical_lf": "7ce3de91c8dfd3c17532332d8f6516f3aa377bb2c40b22fe9371fc349a5200ee"
+  },
+  "carried_forward_payload_ids": [
+    "persona-04",
+    "encoding-03",
+    "fake-system-04",
+    "template-02",
+    "template-03"
+  ],
+  "strategy_ids": [
+    "delimiter-line-collision",
+    "nested-marker-imitation",
+    "escape-newline-reconstruction",
+    "cross-span-instruction-framing",
+    "policy-task-laundering"
+  ],
+  "context_selection": {
+    "rule": "For each payload, take the first four rows from eligible_stopped_cases.tsv in committed manifest order; context 1 is the fixed v1 case.",
+    "context_count_per_payload": 4,
+    "total_context_rows": 20,
+    "all_full_case_keys_distinct": true,
+    "source_rows_verified_before_freeze": true
+  },
+  "iteration_budget": {
+    "max_mutations_per_payload": 20,
+    "max_total_mutation_attempts": 100,
+    "rounds": "1 through 20 for each payload",
+    "strategy_mapping": "STRATEGY_IDS[(round - 1) // 4]",
+    "context_mapping": "ctx_list[(round - 1) % 4]",
+    "coverage": "Each of five frozen strategies is paired once with each of four frozen contexts per payload.",
+    "stop_per_payload": "first native AgentDojo success or 20 mutations exhausted"
+  },
+  "models": {
+    "proposer_model": "gemma-4-26b-a4b-it",
+    "target_model": "gemma-4-26b-a4b-it",
+    "proposer_factory": "get_google_gemma4_26b_llm",
+    "target_factory": "get_google_gemma4_26b_llm"
+  },
+  "quota": {
+    "guard": "QuotaGuard",
+    "quota_key": "gemma-4-26b-a4b-it",
+    "study_rpd_limit": 14400,
+    "reserved_margin": 25,
+    "required_cli_arguments": [
+      "--quota-date",
+      "--dashboard-used",
+      "--dashboard-limit",
+      "--max-api-requests"
+    ],
+    "fresh_dashboard_reading_required_each_run": true,
+    "projected_target_requests": 775,
+    "projected_proposer_requests": 100
+  },
+  "outputs": {
+    "root": "data/adaptive/g4/v2a",
+    "attempts": "data/adaptive/g4/v2a/attempts.jsonl",
+    "summary": "data/adaptive/g4/v2a/loop_summary.json",
+    "raw_traces": "data/adaptive/g4/v2a/results/raw"
+  },
+  "reporting": {
+    "encoding-03": "transfer test because v1 already confirmed a bypass",
+    "no_prior_v1_success_payloads": [
+      "persona-04",
+      "fake-system-04",
+      "template-02",
+      "template-03"
+    ],
+    "pooling_rule": "Report encoding-03 separately and do not pool it with the four payloads that had no prior v1 success. Never merge v2a results with v2b."
+  },
+  "api_calls_made": false,
+  "execution_status": "design-only-no-api-calls",
+  "immutability_rule": "Any change to this design after execution begins requires a new adaptive_attack_version and new output root."
+}

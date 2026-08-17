@@ -212,3 +212,69 @@ whether the output passed validation.
 **Reason:** Gemma 4 could exhaust its proposer output budget in `thought=True` content before emitting a template; the target path then crashed before request accounting because the counter name was not imported; and the checkpoint treated crash/error rows as completed, preventing retry. These fixes distinguish reasoning truncation and execution errors from genuine AgentDojo verdicts while preserving the full failure history.
 
 **Impact:** Proposer calls now use `max_output_tokens=4096` with minimal thinking and classify thought-only responses as truncated; target calls record real request counts; error rows remain retryable; and the archived pre-fix records remain separate from the canonical completed-attempt results.
+
+### Phase 11 — Gemma-only bypass verification reconciliation
+
+**Decision:** On 2026-08-16, reconciled build-guide task 11.4a with the executed Gemma-only design by requiring confirmed bypasses to have completed row and raw-trace evidence that both proposer and target use `gemma-4-26b-a4b-it`, with no fallback/testing-model substitution; no separate cross-model confirmation run is required.
+
+**Reason:** The stale task text referred to `get_google_primary_llm()` from the archived Gemini Phase 6A track, while `adaptive_loop.py` uses `get_google_gemma4_26b_llm()` for both roles to preserve consistency with the Phase 9 recorded baseline. Because the proposer and target already share the designated recorded model, a primary-versus-cross-model confirmation split is inapplicable.
+
+**Impact:** Phase 11 case-study recording now validates the completed `data/adaptive/g4/v1/attempts.jsonl` row and referenced raw trace for Gemma model provenance before counting a bypass; no adaptive code or existing experiment artifact is changed.
+
+### Phase 10/11 — Versioned v2 adaptive-search budget
+
+**Decision:** Preserve the completed five-mutation v1 search unchanged and pre-register separate v2a/v2b arms with at most 20 mutations per payload across the first four eligible contexts in committed-manifest order.
+
+**Reason:** The v1 budget was too small to distinguish strategy effects from one-context sensitivity; the new 20-query limit follows the approved PAIR/TAP-inspired bounded-search rationale and was fixed before either v2 arm made an API call.
+
+**Impact:** Each v2 arm has a 100-attempt worst-case budget, rotates all five frozen strategies across four contexts, stops each payload on its first native AgentDojo success, and writes only to its own versioned output root.
+
+### Phase 10/11 — v2b proposer-model ablation
+
+**Decision:** Add a separately reported v2b ablation using `gemini-3.5-flash-lite` as proposer while retaining `gemma-4-26b-a4b-it` as the target; v2a retains Gemma for both roles as required by Phase 10.6.
+
+**Reason:** The approved ablation tests whether proposer capability, rather than the unchanged target/defense pair, limits candidate quality; it is not a replacement for or continuation of v2a.
+
+**Impact:** V2a and v2b have independent checkpoints, summaries, quotas, and results and must never be pooled into one adaptive-search success count.
+
+### Phase 10/11 — Dual-key quota reservation for v2b
+
+**Decision:** Extend `src/experiments/quota_guard.py` with a backward-compatible `MultiQuotaGuard` that reserves and reconciles the Gemini proposer and Gemma target keys under one ledger lock, using an independent proposer limiter and the existing Gemma limiter.
+
+**Reason:** The existing process-wide limiter cannot safely cap two independently metered model quotas, while separate guards would violate the single-process lock and atomic-reservation requirement.
+
+**Impact:** V2b requires fresh dashboard readings and explicit caps for both keys on every run; per-key ledger history is never cross-reconciled, and existing single-key runners remain unchanged.
+
+### Phase 10/11 — Phase 6A proposer-artifact audit correction
+
+**Decision:** Base the v2b proposer-format expectation on the committed per-stage Phase 6A files at `origin/phase-6a-attack-calibration`, because no aggregate `data/attack_calibration/attempts.jsonl` exists on that branch.
+
+**Reason:** Read-only `git show` at commit `7c354f9a0cc74df9286287f87499709fcbfd076b` found 33/40 strict-parser malformed rows in `mutate/generator_attempts.jsonl` and only 1/40 malformed with zero refusals in `mutate_v2/generator_attempts.jsonl`. The sole v2 malformed note records an environment-renderability failure, not a refusal; five same-seed rows that were malformed under the strict parser were accepted in v2 with `fenced_json` normalization and notes stating that JSON and the goal token validated after canonical normalization.
+
+**Impact:** The expected v2b proposer malformed/refusal rate remains approximately 2.5% or lower with the adaptive loop's equally tolerant extraction chain; this is an engineering expectation, not an executed v2b result.
+
+### Phase 10/11 — Scoped template-02 malformed-proposer repair
+
+**Decision:** Add `src/adaptive/repair_malformed.py`, a separate checkpoint and raw-trace namespace that regenerates and benchmarks only the sixteen v2a `template-02` rounds rejected for duplicate `{{goal}}` placeholders; the original v2a JSONL remains read-only. The repair path rejects obvious double-encoded JSON template wrappers before target execution.
+
+**Reason:** The original rows contain no usable candidate or target verdict, so they cannot be benchmarked by resume alone. A narrowly scoped repair runner permits fresh proposals and accepts one or more goal placeholders only for this supplemental path; skipped proposer/renderability rows remain retryable, without changing normal adaptive-loop parsing or touching other payload results.
+
+**Impact:** Repair artifacts are written under `data/adaptive/g4/v2a_repair/`, are reported separately from v2a, and require the same Gemma quota guard before any future live execution.
+
+### Phase 11 — Logical template-02 merge for 11.4/11.5 reporting
+
+**Decision:** For Phase 11.4/11.5 reporting, join each completed
+`v2a_repair` row to its sixteen malformed `v2a` source rounds and treat the
+result as one logical 20-round `v2a` `template-02` run; retain the separate raw
+artifact roots only as provenance.
+
+**Reason:** The original `v2a` rows for those rounds contain no target verdict,
+while the repair execution completes the same predeclared rounds. Reporting
+only the four original target evaluations would omit the complete payload view;
+the user's accepted Phase 11 scope requires the repaired results to be merged,
+while keeping `v2b` as a distinct proposer-model ablation.
+
+**Impact:** `report/case_studies/` reports 20 logical `v2a` `template-02`
+rounds—four original completed rows plus sixteen source-linked repair rows—with
+zero native successes. The immutable JSONL/checkpoint/raw files remain under
+their existing arm-specific paths, and no repair row is pooled with `v2b`.

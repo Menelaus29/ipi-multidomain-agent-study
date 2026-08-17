@@ -267,5 +267,48 @@ class GoogleLLMFactoryTests(unittest.TestCase):
         self.assertEqual(before, repr(messages))
 
 
+class FactoryRateLimiterPassthroughTests(unittest.TestCase):
+    """The v2b adaptive arm injects a dedicated limiter into the proposer."""
+
+    def test_get_google_llm_uses_injected_rate_limiter(self) -> None:
+        from src.llm_providers.google_llm_factory import (
+            _REQUEST_RATE_LIMITER,
+            get_google_llm,
+        )
+
+        dedicated = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
+        llm = get_google_llm(PRIMARY_MODEL, rate_limiter=dedicated)
+
+        self.assertIsNotNone(llm._rate_limiter)
+        self.assertIs(llm._rate_limiter, dedicated)
+        self.assertIsNot(llm._rate_limiter, _REQUEST_RATE_LIMITER)
+        self.assertIsNone(llm._token_pacer)
+        self.assertIn(PRIMARY_MODEL, llm.name)
+
+    def test_get_google_primary_llm_forwards_rate_limiter(self) -> None:
+        from src.llm_providers.google_llm_factory import (
+            _REQUEST_RATE_LIMITER,
+            get_google_primary_llm,
+        )
+
+        dedicated = RequestRateLimiter(MIN_REQUEST_INTERVAL_SECONDS)
+        llm = get_google_primary_llm(rate_limiter=dedicated)
+
+        self.assertIs(llm._rate_limiter, dedicated)
+        self.assertEqual(llm.model, PRIMARY_MODEL)
+
+    def test_default_factory_keeps_shared_limiter(self) -> None:
+        from src.llm_providers.google_llm_factory import (
+            _REQUEST_RATE_LIMITER,
+            get_google_llm,
+            get_google_gemma4_26b_llm,
+        )
+
+        self.assertIs(get_google_llm(PRIMARY_MODEL)._rate_limiter, _REQUEST_RATE_LIMITER)
+        self.assertIs(
+            get_google_gemma4_26b_llm()._rate_limiter, _REQUEST_RATE_LIMITER
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
