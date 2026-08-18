@@ -278,3 +278,17 @@ while keeping `v2b` as a distinct proposer-model ablation.
 rounds—four original completed rows plus sixteen source-linked repair rows—with
 zero native successes. The immutable JSONL/checkpoint/raw files remain under
 their existing arm-specific paths, and no repair row is pooled with `v2b`.
+
+### Phase 12 — Merge repair presentation into v2a
+
+**Decision:** Omit the standalone `v2a_repair` panel from the Phase 12 figure
+and table, retain its source-linked outcomes inside the logical v2a result, and
+label the separate v2b panel without the word "ablation."
+
+**Reason:** The user clarified that the repair execution completes the same
+predeclared v2a rounds and should therefore be presented as part of v2a rather
+than as a separate visual result.
+
+**Impact:** Phase 12 has primary, v2b, replication, and original-static panels;
+repair artifacts remain independently hashed and reconciled as v2a provenance,
+and v2b remains model-labeled and unpooled despite the shorter display label.
