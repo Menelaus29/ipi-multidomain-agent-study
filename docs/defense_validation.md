@@ -1,7 +1,8 @@
-# Phase 9 defense validation (amended replication panel)
+# Phase 9 defense validation (repurposed replication development panel)
 
-This is an implementation-validation record, not the primary Banking
-defense-effectiveness result. The panel is the exact 20-row true-replication
+This is an implementation-validation record, not held-out evidence or the
+primary Banking defense-effectiveness result. After the alternate validation
+surfaces were exhausted, the panel was repurposed from the exact 20-row true-replication
 partition derived from the original 46-row Banking discovery plan and the
 frozen 180-row selected-payload follow-up. Its manifest is
 `data/defended/g4/v1/replication_dev/manifest.tsv` with SHA-256

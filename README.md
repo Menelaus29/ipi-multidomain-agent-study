@@ -11,20 +11,22 @@ replace that floor; its final development search found 0/38 native successes,
 so it did not qualify a held-out Gemini defense comparison. This is a
 model-and-attack-set null result, not a claim of immunity.
 
-The empirical defense track is therefore model-separated under Gemma 4
+The empirical defense track is model-separated under Gemma 4
 (`gemma-4-26b-a4b-it`). Its parity baseline found 5/110 successes, all in
-Banking. The predeclared selected-payload Banking follow-up found 34/160
-successes on fresh cases and 6/20 on replication cases; those results are
-Banking- and payload-selection-specific. A defended follow-up run is not yet
-included.
+Banking. The selected-payload Banking follow-up found 34/160 successes on fresh
+cases and 6/20 on replication cases; the frozen defense reduced the matched
+fresh result to 4/160. The bounded adaptive searches bypassed 1/5 payloads in
+v1, 1/5 in v2a, and 5/5 in v2b. These are Banking- and
+payload-selection-specific results, and the adaptive counts are payload-level
+bypass coverage rather than post-adaptive ASR.
 
-The complete Phase 6A calibration code and raw artifacts remain preserved on
-the `phase-6a-attack-calibration` branch, with the later full history preserved
-on `phase-8-defense-spotlighting`. The curated main branch intentionally omits
-the Phase 6A generator, mutation, split, clean-control, and calibration-data
-bulk. The frozen Gemma diagnostic evidence remains under `data/diagnostics/`;
-its replay driver stays on the archive branch because it consumes the archived
-Phase 6A manifests.
+Under the executed repository-scope decision, the complete failed Phase 6A
+calibration code and raw artifacts remain branch-local on
+`phase-6a-attack-calibration`, with the later full history also reachable from
+`phase-8-defense-spotlighting`; they were not merged into curated `main`. The
+frozen Gemma diagnostic evidence remains under `data/diagnostics/`; its replay
+driver stays on the archive branch because it consumes the archived Phase 6A
+manifests.
 
 The main research track therefore keeps the original static null, the Gemma
 diagnostic/baseline/follow-up evidence, shared execution and schema safeguards,

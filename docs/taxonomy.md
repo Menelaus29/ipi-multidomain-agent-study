@@ -97,7 +97,7 @@ Roughly: `direct_override` and `fake_system_message` are the most direct route t
 
 **Caveat:** This project uses Google AI Studio through AgentDojo's native `GoogleLLM` pipeline. Tool results arrive as structured `google-genai` SDK `Part` objects, not raw prompt text with manually inserted role delimiters (AgentDojo's `tool_delimiter` belongs to its separate `LocalLLM` path and is not used here). The practical question is therefore whether literal foreign chat-template strings such as `<|eot_id|>` are treated as structural control tokens by the hosted Gemini serving stack or as ordinary content. That cannot be established from AgentDojo's source alone and must be tested empirically.
 
-**Consequences for future phases:** This category remains in the corpus for completeness and literature grounding, but its results will be treated more cautiously than the other five. A 0% ASR is ambiguous between "the defense works" and "this attack surface is not active under Gemini's structured delivery." Phase 5's smoke test is logged in [`payload_corpus_notes.md`](payload_corpus_notes.md).
+**Empirical handling:** Phase 5's Gemini 3.6 smoke test produced a null signal under structured SDK delivery, so the corpus retained three variants rather than padding the category. Later Gemma Banking runs produced native successes for `template-02` and `template-03`, showing that the category was active in that model/context pairing; neither result is generalized across models. The smoke test is logged in [`payload_corpus_notes.md`](payload_corpus_notes.md).
 
 **Instantiation in this study:** file-content channels (most room to embed a multi-token structural payload without looking obviously malformed in a one-line field).
 
@@ -129,7 +129,7 @@ Quick-reference summary for tagging `src/payloads/corpus.json` entries.
 | `encoding_obfuscation` | File content | Workspace, Banking |
 | `multi_step_sleeper` | Requires a real trigger/second-stage pair | Taxonomy only; excluded from the empirical corpus |
 | `fake_system_message` | File, email; less natural in short memo fields | Workspace, Banking, Slack |
-| `chat_template_abuse` | File content | Workspace, Banking, Slack (empirically uncertain everywhere - §2.6) |
+| `chat_template_abuse` | File content | Workspace, Banking (model-dependent - §2.6) |
 
 The resulting corpus has 19 payloads across five empirically instantiated categories. It remains weighted toward `direct_override`, `role_play_persona`, and `encoding_obfuscation`; `multi_step_sleeper` is documented but excluded rather than represented by a fake second stage.
 

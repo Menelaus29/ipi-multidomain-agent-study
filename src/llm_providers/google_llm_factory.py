@@ -42,8 +42,7 @@ MODEL IDs (verified against official Google documentation, 2026-08-05):
   FALLBACK_MODEL = 'gemini-3.1-flash-lite' - GA, generateContent supported
   GEMMA4_26B_MODEL = 'gemma-4-26b-a4b-it' - isolated Gemma study track
 
-Note (Phase 4.2a): This file will be relocated to src/llm_providers/google_llm_factory.py
-when the full src/ tree is built.
+Phase 4.2a relocation is complete: this is the canonical provider-factory path.
 """
 import json
 import logging
@@ -74,7 +73,8 @@ from agentdojo.types import ChatMessage
 
 load_dotenv()
 
-# Primary model — used for all recorded runs and adaptive mutation search.
+# Primary Gemini model — used for the original static/calibration tracks and
+# the v2b proposer ablation, not as the active Gemma target.
 # Active free-tier constraints: 15 RPM, 250k TPM, and 500 RPD.
 PRIMARY_MODEL = "gemini-3.5-flash-lite"
 

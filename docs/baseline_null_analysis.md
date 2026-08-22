@@ -87,10 +87,11 @@ reduction can be calculated from this original static baseline.
 
 The original 0/110 result must therefore remain a separate static-corpus null
 finding. It cannot serve as the denominator for a defense-effectiveness claim.
-Phase 6A prospectively calibrates attacks on development data, freezes the
-attack set, and evaluates it on unseen held-out contexts; only a held-out
-undefended baseline that passes the predeclared nonzero-success gate can support
-the later matched defense comparison.
+Phase 6A prospectively calibrated attacks on development data, but its corrected
+version-2 search ended with 0/38 native successes and failed before any held-out
+Gemini defense comparison. The later matched defense comparison instead uses the
+separate Gemma Banking selected-payload fresh partition, whose undefended result
+was 34/160.
 
 ## Context from recent work
 

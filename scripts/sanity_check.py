@@ -8,7 +8,8 @@ Uses the Python API (benchmark_suite) rather than the CLI.
 See docs/agentdojo_capabilities.md §6 for the full explanation.
 
 PROVIDER: Google AI Studio (GOOGLE_API_KEY)
-  Model: gemini-3.5-flash-lite (primary, recorded runs)
+  Model path: testing-only Gemini wrapper (starts with gemini-3.5-flash-lite
+  and may fall back to gemini-3.1-flash-lite; output is not research data)
   Each suite is pinned to one injection task (`injection_task_0` for Workspace
   and Banking; `injection_task_1` for Slack). The goal is end-to-end framework
   validation, not a full sweep. Full sweeps are Phase 6.

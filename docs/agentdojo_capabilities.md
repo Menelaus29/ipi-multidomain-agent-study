@@ -122,9 +122,9 @@ gemini-2.5-flash-preview-04-17 | gemini-2.5-pro-preview-05-06 |
 local | vllm_parsed | openai-compatible
 ```
 
-My model API key provider of choice, Groq, is **not** in this list.
+The project's provider, Google AI Studio's API-key path, is **not** represented by AgentDojo's built-in Google entries: those resolve through Vertex AI.
 
-**Solution ([groq_llm.py](../scripts/groq_llm.py)):** `PipelineConfig.llm` accepts `str | BasePipelineElement`. When it receives an already-constructed object, `AgentPipeline.from_config()` skips `get_llm()`/`ModelsEnum` and uses the object as-is. Every experiment script in this project constructs `OpenAILLM` directly, pointed at Groq's OpenAI-compatible endpoint.
+**Solution ([google_llm_factory.py](../src/llm_providers/google_llm_factory.py)):** `PipelineConfig.llm` accepts `str | BasePipelineElement`. When it receives an already-constructed object, `AgentPipeline.from_config()` skips `get_llm()`/`ModelsEnum` and uses the object as-is. Every experiment script in this project constructs a GoogleLLM-compatible object with `genai.Client(api_key=GOOGLE_API_KEY)` and passes it directly to `benchmark_suite()`.
 
 **Consequence:** `python -m agentdojo.scripts.benchmark` cannot be used at all for this project's experiments. All runs go through the Python API (`benchmark_suite()`).
 

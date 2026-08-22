@@ -1,6 +1,6 @@
 # Threat Model
 
-**Scope of this document:** the attacker model, trust boundary, delivery methods, and threats actually exercised by this study's three AgentDojo domains - Workspace, Banking, Slack - evaluated against a single primary model (`llama-3.3-70b-versatile`) across undefended, defended, and adaptive-attack conditions. 
+**Scope of this document:** the attacker model, trust boundary, delivery methods, and threats actually exercised by this study's three AgentDojo domains - Workspace, Banking, Slack - across model-separated experiments. The original static and archived calibration tracks use `gemini-3.5-flash-lite`; the active Banking follow-up, defense, and adaptive target use `gemma-4-26b-a4b-it`, while v2b uses Gemini only as a proposer ablation.
 
 ---
 
@@ -10,7 +10,7 @@
 
 The attacker in this study **cannot interact with the agent's interface directly**. Instead, the attacker's only capability is to **place natural-language content inside a data source the agent's tools will later retrieve**, e.g., an email that arrives in an inbox, a file stored in a workspace drive, a transaction memo, a Slack message or channel post, or (Slack only) a web page the agent is instructed to fetch [1, 2, 3]. This requires no access to the model, no ML expertise, and no privileged system access [1] - only the ability to get content into one of these retrievable locations, which in most real deployments is trivial (anyone can send an email or post to a shared channel).
 
-The attacker cannot observe the agent's internal reasoning or tool-call trace, and generally cannot observe the outcome of a successful attack unless the attack itself includes an exfiltration step (e.g., instructing the agent to email data back to an attacker-controlled address) [3]. The attack is therefore blind by default: success is inferred by the attacker only through side effects the attack itself causes.
+In the static-corpus condition, the attacker cannot observe the agent's internal reasoning or tool-call trace and generally cannot observe success except through side effects [3]. The controlled Phase 6A development search and Phase 10-11 defense-adaptive searches deliberately receive permitted benchmark transcripts and native verdict feedback between attempts; they never receive hidden model state, and held-out outcomes are not fed back into attacks evaluated on those same cases.
 
 ### 1.2 Attacker goal
 

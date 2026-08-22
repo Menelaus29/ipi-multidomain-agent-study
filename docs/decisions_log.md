@@ -100,6 +100,14 @@ is permanently bypassed in favour of the Python API.
 
 **Impact:** Existing validation and native-verdict acceptance rules are unchanged. The already-failed, five-request `mutation-v2:builtin:direct:c01:workspace` journal and partial raw trace remain immutable pre-validation evidence; resume recognizes that failed non-renderable target as terminal without repeating it, while future non-renderable candidates are logged as malformed generator records and never reach target execution.
 
+### Phase 6A — Preserve the failed calibration branch without merging it
+
+**Decision:** Keep the complete Phase 6A calibration implementation and bulk artifacts on `phase-6a-attack-calibration` as archival evidence instead of merging them into curated `main`.
+
+**Reason:** The corrected Gemini calibration completed with 0/38 native successes and failed its qualification gate, so its generator, mutation, split, clean-control, and calibration outputs do not serve as inputs to the active Gemma defense track.
+
+**Impact:** `main` retains the original Gemini static null, shared safeguards, and the separate Gemma track; the Phase 6A evidence remains reproducible from its archival branch and must be acknowledged without being presented as a completed held-out baseline.
+
 ### Phase 9-11 — Retarget empirical defense effectiveness to Gemma 4 26B
 
 **Decision:** Preserve Gemini 3.5 Flash-Lite as the primary robustness finding and its failed Phase 6A.11 qualification outcome, but retarget the empirical defense-effectiveness track in Phases 9-11 to `gemma-4-26b-a4b-it`, beginning with a Phase-6-equivalent static baseline that replays the exact ordered 110-row Gemini plan and all 19 retained static-corpus payload IDs represented in it.
@@ -123,6 +131,14 @@ is permanently bypassed in favour of the Python API.
 **Reason:** The shared runner already separates defended outputs by model and defense version, and the short `g4/v1` namespace preserves the tested Windows trace-path margin. This is a storage/provenance clarification only: defended Gemma rows remain separate from Gemini, calibrated-baseline, and original discovery datasets.
 
 **Impact:** Phase 9 uses `data/defended/g4/v1/replication_dev/{builtin,custom}/` for development validation and `data/defended/g4/v1/fresh160/` for the frozen custom-defense evaluation; every defended row retains the Gemma model, plan, payload, and defense hashes, while the 20-row replication panel is excluded from defended aggregation.
+
+### Phase 9 — Repurpose the replication partition for development validation
+
+**Decision:** Repurpose the mechanically derived 20-row true-replication partition as the Phase 9 development/implementation-validation panel, then permanently exclude it from the primary defended comparison.
+
+**Reason:** The available file-content and transaction-memo validation surfaces had been exhausted, while the replication partition supplied 20 fixed, previously observed keys with six fresh live undefended successes and could be selected without using defended outcomes.
+
+**Impact:** Built-in and custom defenses are compared on this panel only as implementation evidence; the frozen 160-fresh partition remains the sole primary Banking defended estimand, and no defended replication estimate is produced.
 
 ### Phase 7/9 — Preserve native utility in future undefended indexes
 

@@ -5,8 +5,9 @@
 This document defines Phase 10's defense-adaptive design for the controlled
 AgentDojo Banking benchmark. It does not authorize execution outside AgentDojo
 and does not modify the already reported Phase 9 static defended comparison.
-The adaptive proposer and target execution are future tasks; no model or API
-call is part of build-guide tasks 10.2--10.4.
+The frozen v1 proposer/target execution and the later v2a/v2b expansions have
+now completed under separate versioned artifacts; none alters the Phase 9
+comparison.
 
 The versioned machine-readable design lives at
 `data/adaptive/g4/v1/strategy_manifest.json`. Its eligible stopped cases live
